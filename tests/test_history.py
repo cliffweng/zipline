@@ -7,7 +7,7 @@ import numpy as np
 from testfixtures import TempDirectory
 
 from zipline import TradingAlgorithm
-from zipline._protocol import handle_non_market_minutes
+from zipline._protocol import handle_bts_minute
 from zipline.assets import Asset
 from zipline.data.data_portal import DataPortal
 from zipline.data.minute_bars import (
@@ -591,7 +591,7 @@ class MinuteEquityHistoryTestCase(HistoryTestCaseBase):
         yesterday_bar_data = \
             BarData(self.data_portal, lambda: last_minute, "minute")
 
-        with handle_non_market_minutes(midnight_bar_data):
+        with handle_bts_minute(midnight_bar_data):
             for field in ALL_FIELDS:
                 np.testing.assert_array_equal(
                     midnight_bar_data.history(self.ASSET2, field, 30, "1m"),

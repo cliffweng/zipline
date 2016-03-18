@@ -22,6 +22,7 @@ import pandas as pd
 from pandas.tslib import normalize_date
 from six import iteritems
 from six.moves import reduce
+from datetime import timedelta
 
 from zipline.assets import Asset, Future, Equity
 from zipline.data.us_equity_pricing import NoDataOnDate
@@ -308,7 +309,49 @@ class DataPortal(object):
 
                 raise KeyError
 
-    def get_spot_value(self, asset, field, dt, data_frequency):
+    def handle_overnight_adjustments(self, df, field, dt):
+        assets = df.columns.tolist()
+
+        # dt at bts is forced back to 4 pm previous day for the purpose of
+        # getting prices, so we want to find adjustments that occur on the
+        # upcoming midnight
+        adjustment_dt = normalize_date(dt + timedelta(days=1))
+
+        adjs = []
+
+        split_adj_factor = lambda x: x if field != 'volume' else 1.0/x
+
+        for asset in assets:
+
+            split_adj = self._get_adjustment_list(
+                asset, self._splits_dict, "SPLITS"
+            )
+            split_adj = \
+                [split_adj_factor(adj) for (adj, adj_dt) in split_adj
+                 if adj_dt == adjustment_dt]
+
+            if field != 'volume':
+                merger_adj = self._get_adjustment_list(
+                    asset, self._mergers_dict, "MERGERS"
+                )
+                merger_adj = [adj for (adj, adj_dt) in merger_adj
+                              if adj_dt == adjustment_dt]
+
+                div_adj = self._get_adjustment_list(
+                    asset, self._dividends_dict, "DIVIDENDS",
+                )
+                div_adj = [adj for (adj, adj_dt) in div_adj
+                           if adj_dt == adjustment_dt]
+            else:
+                merger_adj = div_adj = []
+
+            ratio = reduce(mul, split_adj + merger_adj + div_adj, 1.0)
+            adjs.append(ratio)
+
+        return df * adjs
+
+    def get_spot_value(self, asset, field, dt, data_frequency,
+                       handle_bts=False):
         """
         Public API method that returns a scalar value representing the value
         of the desired asset's field at either the given dt.
@@ -368,9 +411,10 @@ class DataPortal(object):
                     )
                 elif field == "price":
                     return self._get_minute_spot_value(asset, "close", dt,
-                                                       True)
+                                                       True, handle_bts)
                 else:
-                    return self._get_minute_spot_value(asset, field, dt)
+                    return self._get_minute_spot_value(asset, field, dt,
+                                                       handle_bts)
 
     def _get_adjusted_value(self, asset, field, dt,
                             perspective_dt,
@@ -479,7 +523,8 @@ class DataPortal(object):
         else:
             return result
 
-    def _get_minute_spot_value(self, asset, column, dt, ffill=False):
+    def _get_minute_spot_value(self, asset, column, dt, ffill=False,
+                               handle_bts=False):
         result = self._equity_minute_reader.get_value(
             asset.sid, dt, column
         )
@@ -512,11 +557,17 @@ class DataPortal(object):
         if dt == last_traded_dt or dt.date() == last_traded_dt.date():
             return result
 
+        # If we are in before_trading_start, dt is 4pm the previous day, and
+        # we must view from the perspective of midnight after dt to incorporate
+        # any overnight adjustments
+        perspective_dt = \
+            dt if not handle_bts else normalize_date(dt + timedelta(days=1))
+
         # the value we found came from a different day, so we have to adjust
         # the data if there are any adjustments on that day barrier
         return self._get_adjusted_value(
             asset, column, last_traded_dt,
-            dt, "minute", spot_value=result
+            perspective_dt, "minute", spot_value=result
         )
 
     def _get_daily_data(self, asset, column, dt):
@@ -759,7 +810,7 @@ class DataPortal(object):
         )
 
     def get_history_window(self, assets, end_dt, bar_count, frequency, field,
-                           ffill=True):
+                           ffill=True, handle_bts=False):
         """
         Public API method that returns a dataframe containing the requested
         history window.  Data is fully adjusted.
@@ -843,6 +894,9 @@ class DataPortal(object):
                     # all post-end-date values to NaN in that asset's series
                     series = df[asset]
                     series[series.index >= asset.end_date] = np.NaN
+
+        if handle_bts:
+            df = self.handle_overnight_adjustments(df, field, end_dt)
 
         return df
 

@@ -31,7 +31,7 @@ from six import (
     string_types,
 )
 
-from zipline._protocol import handle_non_market_minutes
+from zipline._protocol import handle_bts_minute
 from zipline.data.data_portal import DataPortal
 from zipline.errors import (
     AttachPipelineAfterInitialize,
@@ -392,7 +392,7 @@ class TradingAlgorithm(object):
         if self._before_trading_start is None:
             return
 
-        with handle_non_market_minutes(data) if \
+        with handle_bts_minute(data) if \
                 self.data_frequency == "minute" else ExitStack():
             self._before_trading_start(self, data)
 

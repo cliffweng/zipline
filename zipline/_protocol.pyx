@@ -47,12 +47,12 @@ class assert_keywords(object):
 
 
 @contextmanager
-def handle_non_market_minutes(bar_data):
+def handle_bts_minute(bar_data):
     try:
-        bar_data._handle_non_market_minutes = True
+        bar_data._handle_bts_minute = True
         yield
     finally:
-        bar_data._handle_non_market_minutes = False
+        bar_data._handle_bts_minute = False
 
 
 cdef class BarData:
@@ -219,7 +219,8 @@ cdef class BarData:
                     asset,
                     field,
                     self._get_current_minute(),
-                    self.data_frequency
+                    self.data_frequency,
+                    self._adjust_minutes
                 )
             else:
                 # assume fields is iterable
@@ -229,7 +230,8 @@ cdef class BarData:
                         asset,
                         field,
                         self._get_current_minute(),
-                        self.data_frequency)
+                        self.data_frequency,
+                        self._adjust_minutes)
                     for field in fields
                 }, index=fields, name=assets.symbol)
         else:
@@ -243,7 +245,8 @@ cdef class BarData:
                         asset,
                         field,
                         self._get_current_minute(),
-                        self.data_frequency)
+                        self.data_frequency,
+                        self._adjust_minutes)
                     for asset in assets
                     }, index=assets, name=fields)
             else:
@@ -256,7 +259,8 @@ cdef class BarData:
                             asset,
                             field,
                             self._get_current_minute(),
-                            self.data_frequency)
+                            self.data_frequency,
+                            self._adjust_minutes)
                         for asset in assets
                         }, index=assets, name=field)
 
@@ -433,7 +437,8 @@ cdef class BarData:
                 self._get_current_minute(),
                 bar_count,
                 frequency,
-                fields
+                fields,
+                handle_bts=self._adjust_minutes
             )
 
             if single_asset:
@@ -457,7 +462,8 @@ cdef class BarData:
                         self._get_current_minute(),
                         bar_count,
                         frequency,
-                        field
+                        field,
+                        handle_bts=self._adjust_minutes
                     )[assets] for field in fields
                 })
             else:
@@ -467,7 +473,8 @@ cdef class BarData:
                         self._get_current_minute(),
                         bar_count,
                         frequency,
-                        field
+                        field,
+                        handle_bts=self._adjust_minutes
                     ) for field in fields
                 }
 
@@ -485,7 +492,7 @@ cdef class BarData:
     def fetcher_assets(self):
         return self.data_portal.get_fetcher_assets(self.simulation_dt_func())
 
-    property _handle_non_market_minutes:
+    property _handle_bts_minute:
         def __set__(self, val):
             self._adjust_minutes = val
 
@@ -602,7 +609,8 @@ cdef class SidView:
             self.asset,
             column,
             self.simulation_dt_func(),
-            self.data_frequency
+            self.data_frequency,
+            self._adjust_minutes
         )
 
     def __contains__(self, column):
