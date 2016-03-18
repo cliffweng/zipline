@@ -1224,16 +1224,15 @@ class DataPortal(object):
         # of when the asset started trading and regardless of half days.
         # for a half day, the second half is filled with zeroes.
         # all the minutely bcolz files start on the same day.
-
         try:
             start_idx = self._equity_minute_reader._find_position_of_minute(
-                minutes_for_window[0])
+                minutes_for_window[0].value)
         except KeyError:
             start_idx = 0
 
         try:
             end_idx = self._equity_minute_reader._find_position_of_minute(
-                minutes_for_window[-1]) + 1
+                minutes_for_window[-1].value) + 1
         except KeyError:
             end_idx = 0
 
@@ -1309,7 +1308,6 @@ class DataPortal(object):
 
         if start_date == end_date:
             if field != 'volume':
-                # TODO: Use reader for this value.
                 return_data[return_data == 0] = np.nan
                 return_data *= self.MINUTE_PRICE_ADJUSTMENT_FACTOR
 

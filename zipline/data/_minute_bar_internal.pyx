@@ -1,5 +1,6 @@
 from numpy cimport ndarray, long_t
 from numpy import searchsorted
+import pandas as pd
 cimport cython
 
 from bcolz.carray_ext cimport carray
@@ -36,9 +37,8 @@ def minute_value(ndarray[long_t, ndim=1] market_opens,
 
     return market_opens[q] + r
 
-def find_position_of_minute(ndarray[long_t, ndim=1] market_opens,
-                            long_t minute_val,
-                            short minutes_per_day):
+def find_position_of_minute(ndarray[long_t, ndim=1] minutes,
+                            long_t minute_val):
     """
     Finds the position of a given minute in the given array of market opens.
 
@@ -59,15 +59,10 @@ def find_position_of_minute(ndarray[long_t, ndim=1] market_opens,
     """
     cdef Py_ssize_t market_open_loc, market_open, delta
 
-    market_open_loc = \
-        searchsorted(market_opens, minute_val, side='right') - 1
-    market_open = market_opens[market_open_loc]
-    delta = minute_val - market_open
-
-    return (market_open_loc * minutes_per_day) + delta
+    return searchsorted(minutes, minute_val, side='right') - 1
 
 def find_last_traded_position_internal(
-        ndarray[long_t, ndim=1] market_opens,
+        ndarray[long_t, ndim=1] minutes,
         long_t end_minute,
         long_t start_minute,
         carray volumes,
@@ -100,17 +95,15 @@ def find_last_traded_position_internal(
     """
     cdef Py_ssize_t minute_pos, current_minute
 
-    minute_pos = int_min(
-        find_position_of_minute(market_opens, end_minute, minutes_per_day),
+    start_pos = searchsorted(minutes, start_minute, side='left')
+
+    end_pos = minute_pos = int_min(
+        find_position_of_minute(minutes, end_minute),
         len(volumes) - 1
     )
 
     while minute_pos >= 0:
-        current_minute = minute_value(
-            market_opens, minute_pos, minutes_per_day
-        )
-
-        if current_minute < start_minute:
+        if minute_pos < start_pos:
             return -1
 
         if volumes[minute_pos] != 0:

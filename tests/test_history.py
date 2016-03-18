@@ -384,7 +384,9 @@ class HistoryTestCaseBase(TestCase):
                         np.testing.assert_array_equal(
                             np.array([decile_count * 10 - 9] *
                                      len(first_part)),
-                            first_part
+                            first_part,
+                            err_msg="idx={0} dt={1} mode={2} field={3}".format(
+                                idx, dt, mode, field)
                         )
 
                         np.testing.assert_array_equal(

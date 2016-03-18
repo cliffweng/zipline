@@ -20,15 +20,13 @@ from os.path import join
 import json
 import os
 import pandas as pd
-from zipline.gens.sim_engine import NANOS_IN_MINUTE
 
 from zipline.data._minute_bar_internal import (
-    minute_value,
     find_position_of_minute,
     find_last_traded_position_internal
 )
 
-from zipline.utils.memoize import remember_last
+from zipline.utils.memoize import remember_last, lazyval
 
 US_EQUITIES_MINUTES_PER_DAY = 390
 
@@ -101,11 +99,8 @@ class BcolzMinuteBarMetadata(object):
 
             first_trading_day = pd.Timestamp(
                 raw_data['first_trading_day'], tz='UTC')
-            # TODO: Just write market minutes.
-            minute_index = np.array(
-                [x for i, x in enumerate(raw_data['minute_index'])
-                 if (i % 390) == 0], dtype='datetime64[ns]').astype(
-                'datetime64[m]')
+            minute_index = pd.to_datetime(raw_data['minute_index'],
+                                          utc=True)
             ohlc_ratio = raw_data['ohlc_ratio']
             return cls(first_trading_day, minute_index, ohlc_ratio)
 
@@ -523,16 +518,6 @@ class BcolzMinuteBarReader(object):
         """
         self._rootdir = rootdir
 
-        metadata = self._get_metadata()
-
-        self._first_trading_day = metadata.first_trading_day
-
-        # store a list of "minute epoch" values
-        self._minute_value_index = \
-            metadata.minute_index.astype('datetime64[m]').astype(int)
-
-        self._ohlc_inverse = 1.0 / metadata.ohlc_ratio
-
         self._carrays = {
             'open': {},
             'high': {},
@@ -541,12 +526,21 @@ class BcolzMinuteBarReader(object):
             'volume': {},
         }
 
-    def _get_metadata(self):
+    @lazyval
+    def _metadata(self):
         return BcolzMinuteBarMetadata.read(self._rootdir)
 
-    @property
+    @lazyval
+    def _minute_value_index(self):
+        return self._metadata.minute_index.values.astype(int)
+
+    @lazyval
+    def _ohlc_inverse(self):
+        return 1.0 / self._metadata.ohlc_ratio
+
+    @lazyval
     def first_trading_day(self):
-        return self._first_trading_day
+        return self._metadata.first_trading_day
 
     def _get_carray_path(self, sid, field):
         sid_subdir = _sid_subdir_path(sid)
@@ -593,7 +587,7 @@ class BcolzMinuteBarReader(object):
             Returns the integer value of the volume.
             (A volume of 0 signifies no trades for the given dt.)
         """
-        minute_pos = self._find_position_of_minute(dt)
+        minute_pos = self._find_position_of_minute(dt.value)
         value = self._open_minute_file(field, sid)[minute_pos]
         if value == 0:
             if field == 'volume':
@@ -612,31 +606,26 @@ class BcolzMinuteBarReader(object):
 
     def _find_last_traded_position(self, asset, dt):
         volumes = self._open_minute_file('volume', asset)
-        start_date_minutes = asset.start_date.value / NANOS_IN_MINUTE
-        dt_minutes = dt.value / NANOS_IN_MINUTE
+        start_date_val = asset.start_date.value
+        dt_val = dt.value
 
-        if dt_minutes < start_date_minutes:
+        if dt_val < start_date_val:
             return -1
 
         return find_last_traded_position_internal(
             self._minute_value_index,
-            dt_minutes,
-            start_date_minutes,
+            dt_val,
+            start_date_val,
             volumes,
             US_EQUITIES_MINUTES_PER_DAY
         )
 
     def _pos_to_minute(self, pos):
-        minute_epoch = minute_value(
-            self._minute_value_index,
-            pos,
-            US_EQUITIES_MINUTES_PER_DAY
-        )
-
-        return pd.Timestamp(minute_epoch, tz='UTC', unit="m")
+        minute_epoch = self._minute_value_index[pos]
+        return pd.Timestamp(minute_epoch, tz='UTC')
 
     @remember_last
-    def _find_position_of_minute(self, minute_dt):
+    def _find_position_of_minute(self, minute_dt_val):
         """
         Internal method that returns the position of the given minute in the
         list of every trading minute since market open of the first trading
@@ -659,8 +648,7 @@ class BcolzMinuteBarReader(object):
         # is not a trading minute (midnight, for example)
         return find_position_of_minute(
             self._minute_value_index,
-            minute_dt.value / NANOS_IN_MINUTE,
-            US_EQUITIES_MINUTES_PER_DAY
+            minute_dt_val,
         )
 
     def unadjusted_window(self, fields, start_dt, end_dt, sids):
@@ -684,8 +672,8 @@ class BcolzMinuteBarReader(object):
             values for the respective field over start and end dt range.
         """
         # TODO: Handle early closes.
-        start_idx = self._find_position_of_minute(start_dt)
-        end_idx = self._find_position_of_minute(end_dt)
+        start_idx = self._find_position_of_minute(start_dt.value)
+        end_idx = self._find_position_of_minute(end_dt.value)
 
         results = []
 
