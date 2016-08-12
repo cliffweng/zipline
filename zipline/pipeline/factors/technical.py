@@ -2,6 +2,8 @@
 Technical Analysis Factors
 --------------------------
 """
+from __future__ import division
+
 from numbers import Number
 from numpy import (
     abs,
@@ -9,6 +11,7 @@ from numpy import (
     average,
     clip,
     diff,
+    dstack,
     exp,
     fmax,
     full,
@@ -27,9 +30,12 @@ from zipline.utils.numpy_utils import ignore_nanwarnings
 from zipline.utils.input_validation import expect_types
 from zipline.utils.math_utils import (
     nanargmax,
+    nanargmin,
     nanmax,
     nanmean,
+    nanstd,
     nansum,
+    nanmin,
 )
 from .factor import CustomFactor
 
@@ -41,6 +47,16 @@ class Returns(CustomFactor):
     **Default Inputs**: [USEquityPricing.close]
     """
     inputs = [USEquityPricing.close]
+    window_safe = True
+
+    def _validate(self):
+        super(Returns, self)._validate()
+        if self.window_length < 2:
+            raise ValueError(
+                "'Returns' expected a window length of at least 2, but was "
+                "given {window_length}. For daily returns, use a window "
+                "length of 2.".format(window_length=self.window_length)
+            )
 
     def compute(self, today, assets, out, close):
         out[:] = (close[-1] - close[0]) / close[0]
@@ -141,7 +157,7 @@ class AverageDollarVolume(CustomFactor):
     inputs = [USEquityPricing.close, USEquityPricing.volume]
 
     def compute(self, today, assets, out, close, volume):
-        out[:] = nanmean(close * volume, axis=0)
+        out[:] = nansum(close * volume, axis=0) / len(close)
 
 
 class _ExponentialWeightedFactor(SingleInputMixin, CustomFactor):
@@ -349,6 +365,35 @@ class ExponentialWeightedMovingAverage(_ExponentialWeightedFactor):
         )
 
 
+class LinearWeightedMovingAverage(CustomFactor, SingleInputMixin):
+    """
+    Weighted Average Value of an arbitrary column
+
+    **Default Inputs**: None
+
+    **Default Window Length**: None
+    """
+    # numpy's nan functions throw warnings when passed an array containing only
+    # nans, but they still returns the desired value (nan), so we ignore the
+    # warning.
+    ctx = ignore_nanwarnings()
+
+    def compute(self, today, assets, out, data):
+        num_days = data.shape[0]
+
+        # Initialize weights array
+        weights = arange(1, num_days + 1, dtype=float).reshape(num_days, 1)
+
+        # Compute normalizer
+        normalizer = (num_days * (num_days + 1)) / 2
+
+        # Weight the data
+        weighted_data = data * weights
+
+        # Compute weighted averages
+        out[:] = nansum(weighted_data, axis=0) / normalizer
+
+
 class ExponentialWeightedMovingStdDev(_ExponentialWeightedFactor):
     """
     Exponentially Weighted Moving Standard Deviation
@@ -396,3 +441,238 @@ class ExponentialWeightedMovingStdDev(_ExponentialWeightedFactor):
 # Convenience aliases.
 EWMA = ExponentialWeightedMovingAverage
 EWMSTD = ExponentialWeightedMovingStdDev
+
+
+class BollingerBands(CustomFactor):
+    """
+    Bollinger Bands technical indicator.
+    https://en.wikipedia.org/wiki/Bollinger_Bands
+
+    **Default Inputs:** :data:`zipline.pipeline.data.USEquityPricing.close`
+
+    Parameters
+    ----------
+    inputs : length-1 iterable[BoundColumn]
+        The expression over which to compute bollinger bands.
+    window_length : int > 0
+        Length of the lookback window over which to compute the bollinger
+        bands.
+    k : float
+        The number of standard deviations to add or subtract to create the
+        upper and lower bands.
+    """
+    params = ('k',)
+    inputs = (USEquityPricing.close,)
+    outputs = 'lower', 'middle', 'upper'
+
+    def compute(self, today, assets, out, close, k):
+        difference = k * nanstd(close, axis=0)
+        out.middle = middle = nanmean(close, axis=0)
+        out.upper = middle + difference
+        out.lower = middle - difference
+
+
+class Aroon(CustomFactor):
+    """
+    Aroon technical indicator.
+    https://www.fidelity.com/learning-center/trading-investing/technical-analysis/technical-indicator-guide/aroon-indicator  # noqa
+
+    **Defaults Inputs:** USEquityPricing.low, USEquityPricing.high
+
+    Parameters
+    ----------
+    window_length : int > 0
+        Length of the lookback window over which to compute the Aroon
+        indicator.
+    """
+
+    inputs = (USEquityPricing.low, USEquityPricing.high)
+    outputs = ('down', 'up')
+
+    def compute(self, today, assets, out, lows, highs):
+        wl = self.window_length
+        high_date_index = nanargmax(highs, axis=0)
+        low_date_index = nanargmin(lows, axis=0)
+        evaluate(
+            '(100 * high_date_index) / (wl - 1)',
+            local_dict={
+                'high_date_index': high_date_index,
+                'wl': wl,
+            },
+            out=out.up,
+        )
+        evaluate(
+            '(100 * low_date_index) / (wl - 1)',
+            local_dict={
+                'low_date_index': low_date_index,
+                'wl': wl,
+            },
+            out=out.down,
+        )
+
+
+class FastStochasticOscillator(CustomFactor):
+    """
+    Fast Stochastic Oscillator Indicator [%K, Momentum Indicator]
+    https://wiki.timetotrade.eu/Stochastic
+
+    This stochastic is considered volatile, and varies a lot when used in
+    market analysis. It is recommended to use the slow stochastic oscillator
+    or a moving average of the %K [%D].
+
+    **Default Inputs:** :data: `zipline.pipeline.data.USEquityPricing.close`
+                        :data: `zipline.pipeline.data.USEquityPricing.low`
+                        :data: `zipline.pipeline.data.USEquityPricing.high`
+
+    **Default Window Length:** 14
+
+    Returns
+    -------
+    out: %K oscillator
+    """
+    inputs = (USEquityPricing.close, USEquityPricing.low, USEquityPricing.high)
+    window_safe = True
+    window_length = 14
+
+    def compute(self, today, assets, out, closes, lows, highs):
+
+        highest_highs = nanmax(highs, axis=0)
+        lowest_lows = nanmin(lows, axis=0)
+        today_closes = closes[-1]
+
+        evaluate(
+            '((tc - ll) / (hh - ll)) * 100',
+            local_dict={
+                'tc': today_closes,
+                'll': lowest_lows,
+                'hh': highest_highs,
+            },
+            global_dict={},
+            out=out,
+        )
+
+
+class IchimokuKinkoHyo(CustomFactor):
+    """Compute the various metrics for the Ichimoku Kinko Hyo (Ichimoku Cloud).
+    http://stockcharts.com/school/doku.php?id=chart_school:technical_indicators:ichimoku_cloud  # noqa
+
+    **Default Inputs:** :data:`zipline.pipeline.data.USEquityPricing.high`
+                        :data:`zipline.pipeline.data.USEquityPricing.low`
+                        :data:`zipline.pipeline.data.USEquityPricing.close`
+    **Default Window Length:** 52
+
+    Parameters
+    ----------
+    window_length : int > 0
+        The length the the window for the senkou span b.
+    tenkan_sen_length : int >= 0, <= window_length
+        The length of the window for the tenkan-sen.
+    kijun_sen_length : int >= 0, <= window_length
+        The length of the window for the kijou-sen.
+    chikou_span_length : int >= 0, <= window_length
+        The lag for the chikou span.
+    """
+
+    params = {
+        'tenkan_sen_length': 9,
+        'kijun_sen_length': 26,
+        'chikou_span_length': 26,
+    }
+    inputs = USEquityPricing.high, USEquityPricing.close
+    outputs = (
+        'tenkan_sen',
+        'kijun_sen',
+        'senkou_span_a',
+        'senkou_span_b',
+        'chikou_span',
+    )
+    window_length = 52
+
+    def _validate(self):
+        super(IchimokuKinkoHyo, self)._validate()
+        for k, v in self.params.items():
+            if v > self.window_length:
+                raise ValueError(
+                    '%s must be <= the window_length: %s > %s' % (
+                        k, v, self.window_length,
+                    ),
+                )
+
+    def compute(self,
+                today,
+                assets,
+                out,
+                high,
+                low,
+                close,
+                tenkan_sen_length,
+                kijun_sen_length,
+                chikou_span_length):
+
+        out.tenkan_sen = tenkan_sen = (
+            high[-tenkan_sen_length:].max(axis=0) +
+            low[-tenkan_sen_length:].min(axis=0)
+        ) / 2
+        out.kijun_sen = kijun_sen = (
+            high[-kijun_sen_length:].max(axis=0) +
+            low[-kijun_sen_length:].min(axis=0)
+        ) / 2
+        out.senkou_span_a = (tenkan_sen + kijun_sen) / 2
+        out.senkou_span_b = (high.max(axis=0) + low.min(axis=0)) / 2
+        out.chikou_span = close[chikou_span_length]
+
+
+class RateOfChangePercentage(CustomFactor):
+    """
+    Rate of change Percentage
+    ROC measures the percentage change in price from one period to the next.
+    The ROC calculation compares the current price with the price `n`
+    periods ago.
+    Formula for calculation: ((price - prevPrice) / prevPrice) * 100
+    price - the current price
+    prevPrice - the price n days ago, equals window length
+    """
+    def compute(self, today, assets, out, close):
+        today_close = close[-1]
+        prev_close = close[0]
+        evaluate('((tc - pc) / pc) * 100',
+                 local_dict={
+                     'tc': today_close,
+                     'pc': prev_close
+                 },
+                 global_dict={},
+                 out=out,
+                 )
+
+
+class TrueRange(CustomFactor):
+    """
+    True Range
+
+    A technical indicator originally developed by J. Welles Wilder, Jr.
+    Indicates the true degree of daily price change in an underlying.
+
+    **Default Inputs:** :data:`zipline.pipeline.data.USEquityPricing.high`
+                        :data:`zipline.pipeline.data.USEquityPricing.low`
+                        :data:`zipline.pipeline.data.USEquityPricing.close`
+    **Default Window Length:** 2
+    """
+    inputs = (
+        USEquityPricing.high,
+        USEquityPricing.low,
+        USEquityPricing.close,
+    )
+    window_length = 2
+
+    def compute(self, today, assets, out, highs, lows, closes):
+        high_to_low = highs[1:] - lows[1:]
+        high_to_prev_close = abs(highs[1:] - closes[:-1])
+        low_to_prev_close = abs(lows[1:] - closes[:-1])
+        out[:] = nanmax(
+            dstack((
+                high_to_low,
+                high_to_prev_close,
+                low_to_prev_close,
+            )),
+            2
+        )

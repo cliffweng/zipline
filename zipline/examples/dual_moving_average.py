@@ -22,17 +22,11 @@ its shares once the averages cross again (indicating downwards
 momentum).
 """
 
-from zipline.api import order_target, record, symbol, history, add_history
+from zipline.api import order_target, record, symbol
 
 
 def initialize(context):
-    # Register 2 histories that track daily prices,
-    # one with a 100 window and one with a 300 day window
-    add_history(100, '1d', 'price')
-    add_history(300, '1d', 'price')
-
     context.sym = symbol('AAPL')
-
     context.i = 0
 
 
@@ -45,21 +39,21 @@ def handle_data(context, data):
     # Compute averages
     # history() has to be called with the same params
     # from above and returns a pandas dataframe.
-    short_mavg = history(100, '1d', 'price').mean()
-    long_mavg = history(300, '1d', 'price').mean()
+    short_mavg = data.history(context.sym, 'price', 100, '1d').mean()
+    long_mavg = data.history(context.sym, 'price', 300, '1d').mean()
 
     # Trading logic
-    if short_mavg[context.sym] > long_mavg[context.sym]:
+    if short_mavg > long_mavg:
         # order_target orders as many shares as needed to
         # achieve the desired number of shares.
         order_target(context.sym, 100)
-    elif short_mavg[context.sym] < long_mavg[context.sym]:
+    elif short_mavg < long_mavg:
         order_target(context.sym, 0)
 
     # Save values for later inspection
-    record(AAPL=data[context.sym].price,
-           short_mavg=short_mavg[context.sym],
-           long_mavg=long_mavg[context.sym])
+    record(AAPL=data.current(context.sym, "price"),
+           short_mavg=short_mavg,
+           long_mavg=long_mavg)
 
 
 # Note: this function can be removed if running
@@ -103,26 +97,12 @@ def analyze(context=None, results=None):
     plt.show()
 
 
-# Note: this if-block should be removed if running
-# this algorithm on quantopian.com
-if __name__ == '__main__':
-    from datetime import datetime
-    import pytz
-    from zipline.algorithm import TradingAlgorithm
-    from zipline.utils.factory import load_from_yahoo
+def _test_args():
+    """Extra arguments to use when zipline's automated tests run this example.
+    """
+    import pandas as pd
 
-    # Set the simulation start and end dates.
-    start = datetime(2011, 1, 1, 0, 0, 0, 0, pytz.utc)
-    end = datetime(2013, 1, 1, 0, 0, 0, 0, pytz.utc)
-
-    # Load price data from yahoo.
-    data = load_from_yahoo(stocks=['AAPL'], indexes={}, start=start,
-                           end=end)
-
-    # Create and run the algorithm.
-    algo = TradingAlgorithm(initialize=initialize, handle_data=handle_data,
-                            identifiers=['AAPL'])
-    results = algo.run(data)
-
-    # Plot the portfolio and asset data.
-    analyze(results=results)
+    return {
+        'start': pd.Timestamp('2011', tz='utc'),
+        'end': pd.Timestamp('2013', tz='utc'),
+    }

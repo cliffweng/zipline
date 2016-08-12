@@ -23,7 +23,7 @@ def invert(d):
     """
     Invert a dictionary into a dictionary of sets.
 
-    >>> invert({'a': 1, 'b': 2, 'c': 1})
+    >>> invert({'a': 1, 'b': 2, 'c': 1})  # doctest: +SKIP
     {1: {'a', 'c'}, 2: {'b'}}
     """
     out = {}
@@ -33,3 +33,13 @@ def invert(d):
         except KeyError:
             out[v] = {k}
     return out
+
+
+def invert_unique(d, check=True):
+    """
+    Invert a dictionary with unique values into a dictionary with (k, v) pairs
+    flipped.
+    """
+    if check:
+        assert len(set(d.values())) == len(d), "Values were not unique!"
+    return {v: k for k, v in iteritems(d)}

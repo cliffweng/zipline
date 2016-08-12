@@ -34,10 +34,6 @@ from . risk import (
     sortino_ratio,
 )
 
-from zipline.utils.serialization_utils import (
-    VERSION_LABEL
-)
-
 log = logbook.Logger('Risk Cumulative')
 
 
@@ -90,36 +86,34 @@ class RiskMetricsCumulative(object):
         'information',
     )
 
-    def __init__(self, sim_params, env,
+    def __init__(self, sim_params, treasury_curves, trading_calendar,
                  create_first_day_stats=False):
-        self.treasury_curves = env.treasury_curves
-        self.start_date = sim_params.period_start.replace(
-            hour=0, minute=0, second=0, microsecond=0
-        )
-        self.end_date = sim_params.period_end.replace(
-            hour=0, minute=0, second=0, microsecond=0
-        )
+        self.treasury_curves = treasury_curves
+        self.trading_calendar = trading_calendar
+        self.start_session = sim_params.start_session
+        self.end_session = sim_params.end_session
 
-        self.trading_days = env.days_in_range(self.start_date, self.end_date)
+        self.sessions = trading_calendar.sessions_in_range(
+            self.start_session, self.end_session
+        )
 
         # Hold on to the trading day before the start,
         # used for index of the zero return value when forcing returns
         # on the first day.
-        self.day_before_start = self.start_date - env.trading_days.freq
+        self.day_before_start = self.start_session - self.sessions.freq
 
-        last_day = normalize_date(sim_params.period_end)
-        if last_day not in self.trading_days:
+        last_day = normalize_date(sim_params.end_session)
+        if last_day not in self.sessions:
             last_day = pd.tseries.index.DatetimeIndex(
                 [last_day]
             )
-            self.trading_days = self.trading_days.append(last_day)
+            self.sessions = self.sessions.append(last_day)
 
         self.sim_params = sim_params
-        self.env = env
 
         self.create_first_day_stats = create_first_day_stats
 
-        cont_index = self.trading_days
+        cont_index = self.sessions
 
         self.cont_index = cont_index
         self.cont_len = len(self.cont_index)
@@ -166,7 +160,7 @@ class RiskMetricsCumulative(object):
         self.max_leverages = empty_cont.copy()
         self.max_leverage = 0
         self.current_max = -np.inf
-        self.daily_treasury = pd.Series(index=self.trading_days)
+        self.daily_treasury = pd.Series(index=self.sessions)
         self.treasury_period_return = np.nan
 
         self.num_trading_days = 0
@@ -251,8 +245,8 @@ algorithm_returns ({algo_count}) in range {start} : {end} on {dt}"
             message = message.format(
                 bm_count=len(self.benchmark_returns),
                 algo_count=len(self.algorithm_returns),
-                start=self.start_date,
-                end=self.end_date,
+                start=self.start_session,
+                end=self.end_session,
                 dt=dt
             )
             raise Exception(message)
@@ -271,9 +265,9 @@ algorithm_returns ({algo_count}) in range {start} : {end} on {dt}"
         if np.isnan(self.daily_treasury[treasury_end]):
             treasury_period_return = choose_treasury(
                 self.treasury_curves,
-                self.start_date,
+                self.start_session,
                 treasury_end,
-                self.env,
+                self.trading_calendar,
             )
             self.daily_treasury[treasury_end] = treasury_period_return
         self.treasury_period_return = self.daily_treasury[treasury_end]
@@ -454,23 +448,3 @@ algorithm_returns ({algo_count}) in range {start} : {end} on {dt}"
         beta = algorithm_covariance / benchmark_variance
 
         return beta
-
-    def __getstate__(self):
-        state_dict = {k: v for k, v in iteritems(self.__dict__)
-                      if not k.startswith('_')}
-
-        STATE_VERSION = 3
-        state_dict[VERSION_LABEL] = STATE_VERSION
-
-        return state_dict
-
-    def __setstate__(self, state):
-
-        OLDEST_SUPPORTED_STATE = 3
-        version = state.pop(VERSION_LABEL)
-
-        if version < OLDEST_SUPPORTED_STATE:
-            raise BaseException("RiskMetricsCumulative \
-                    saved state is too old.")
-
-        self.__dict__.update(state)

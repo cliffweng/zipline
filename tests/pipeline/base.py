@@ -2,26 +2,28 @@
 Base class for Pipeline API  unittests.
 """
 from functools import wraps
-from unittest import TestCase
 
 import numpy as np
 from numpy import arange, prod
 from pandas import date_range, Int64Index, DataFrame
 from six import iteritems
 
-from zipline.pipeline import TermGraph
+from zipline.assets.synthetic import make_simple_equity_info
 from zipline.pipeline.engine import SimplePipelineEngine
+from zipline.pipeline import TermGraph
 from zipline.pipeline.term import AssetExists
 from zipline.testing import (
     check_arrays,
     ExplodingObject,
-    make_simple_equity_info,
     tmp_asset_finder,
+)
+from zipline.testing.fixtures import (
+    WithTradingCalendars,
+    ZiplineTestCase,
 )
 
 from zipline.utils.functional import dzip_exact
 from zipline.utils.pandas_utils import explode
-from zipline.utils.tradingcalendar import trading_day
 
 
 def with_defaults(**default_funcs):
@@ -51,11 +53,14 @@ def with_defaults(**default_funcs):
 with_default_shape = with_defaults(shape=lambda self: self.default_shape)
 
 
-class BasePipelineTestCase(TestCase):
+class BasePipelineTestCase(WithTradingCalendars, ZiplineTestCase):
 
     @classmethod
-    def setUpClass(cls):
-        cls.__calendar = date_range('2014', '2015', freq=trading_day)
+    def init_class_fixtures(cls):
+        super(BasePipelineTestCase, cls).init_class_fixtures()
+
+        cls.__calendar = date_range('2014', '2015',
+                                    freq=cls.trading_calendar.day)
         cls.__assets = assets = Int64Index(arange(1, 20))
         cls.__tmp_finder_ctx = tmp_asset_finder(
             equities=make_simple_equity_info(
@@ -69,10 +74,6 @@ class BasePipelineTestCase(TestCase):
             cls.__calendar[-30:],
             include_start_date=False,
         )
-
-    @classmethod
-    def tearDownClass(cls):
-        cls.__tmp_finder_ctx.__exit__()
 
     @property
     def default_shape(self):

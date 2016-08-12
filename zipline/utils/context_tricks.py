@@ -41,7 +41,7 @@ class CallbackManager(object):
     >>> with manager('example'):
     ...    print('inside example block')
     entering example block
-    inside example
+    inside example block
     exiting example block
 
     These are reusable with different args:
@@ -57,6 +57,14 @@ class CallbackManager(object):
 
     def __call__(self, *args, **kwargs):
         return _ManagedCallbackContext(self.pre, self.post, args, kwargs)
+
+    # special case, if no extra args are passed make this a context manager
+    # which forwards no args to pre and post
+    def __enter__(self):
+        return self.pre()
+
+    def __exit__(self, *excinfo):
+        self.post()
 
 
 class _ManagedCallbackContext(object):

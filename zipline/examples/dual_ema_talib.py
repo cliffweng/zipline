@@ -26,41 +26,38 @@ momentum).
 
 from zipline.api import order, record, symbol
 # Import exponential moving average from talib wrapper
-from zipline.transforms.ta import EMA
+from talib import EMA
 
 
 def initialize(context):
     context.asset = symbol('AAPL')
-
-    # Add 2 mavg transforms, one with a long window, one with a short window.
-    context.short_ema_trans = EMA(timeperiod=20)
-    context.long_ema_trans = EMA(timeperiod=40)
 
     # To keep track of whether we invested in the stock or not
     context.invested = False
 
 
 def handle_data(context, data):
-    short_ema = context.short_ema_trans.handle_data(data)
-    long_ema = context.long_ema_trans.handle_data(data)
-    if short_ema is None or long_ema is None:
+    trailing_window = data.history(context.asset, 'price', 40, '1d')
+    if trailing_window.isnull().values.any():
         return
+    short_ema = EMA(trailing_window.values, timeperiod=20)
+    long_ema = EMA(trailing_window.values, timeperiod=40)
 
     buy = False
     sell = False
 
-    if (short_ema > long_ema).all() and not context.invested:
+    if (short_ema[-1] > long_ema[-1]) and not context.invested:
         order(context.asset, 100)
         context.invested = True
         buy = True
-    elif (short_ema < long_ema).all() and context.invested:
+    elif (short_ema[-1] < long_ema[-1]) and context.invested:
         order(context.asset, -100)
         context.invested = False
         sell = True
 
-    record(AAPL=data[context.asset].price,
-           short_ema=short_ema[context.asset],
-           long_ema=long_ema[context.asset],
+    record(AAPL=data.current(context.asset, "price"),
+           short_ema=short_ema[-1],
+           long_ema=long_ema[-1],
            buy=buy,
            sell=sell)
 
@@ -101,26 +98,12 @@ def analyze(context=None, results=None):
     plt.show()
 
 
-# Note: this if-block should be removed if running
-# this algorithm on quantopian.com
-if __name__ == '__main__':
-    from datetime import datetime
-    import pytz
-    from zipline.algorithm import TradingAlgorithm
-    from zipline.utils.factory import load_from_yahoo
+def _test_args():
+    """Extra arguments to use when zipline's automated tests run this example.
+    """
+    import pandas as pd
 
-    # Set the simulation start and end dates.
-    start = datetime(2014, 1, 1, 0, 0, 0, 0, pytz.utc)
-    end = datetime(2014, 11, 1, 0, 0, 0, 0, pytz.utc)
-
-    # Load price data from yahoo.
-    data = load_from_yahoo(stocks=['AAPL'], indexes={}, start=start,
-                           end=end)
-
-    # Create and run the algorithm.
-    algo = TradingAlgorithm(initialize=initialize, handle_data=handle_data,
-                            identifiers=['AAPL'])
-    results = algo.run(data).dropna()
-
-    # Plot the portfolio and asset data.
-    analyze(results=results)
+    return {
+        'start': pd.Timestamp('2014-01-01', tz='utc'),
+        'end': pd.Timestamp('2014-11-01', tz='utc'),
+    }

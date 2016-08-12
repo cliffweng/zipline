@@ -12,7 +12,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-from unittest import TestCase
+from sys import maxsize
 
 from nose_parameterized import parameterized
 from numpy import (
@@ -24,22 +24,28 @@ from numpy.testing import (
 )
 from pandas import (
     DataFrame,
-    DatetimeIndex,
     Timestamp,
 )
 from pandas.util.testing import assert_index_equal
-from testfixtures import TempDirectory
 
-from zipline.pipeline.loaders.synthetic import (
-    SyntheticDailyBarWriter,
-)
 from zipline.data.us_equity_pricing import (
     BcolzDailyBarReader,
-    NoDataOnDate
+    NoDataOnDate,
 )
-from zipline.finance.trading import TradingEnvironment
-from zipline.pipeline.data import USEquityPricing
+from zipline.pipeline.loaders.synthetic import (
+    OHLCV,
+    asset_start,
+    asset_end,
+    expected_bar_value,
+    expected_bar_values_2d,
+    make_bar_data,
+)
 from zipline.testing import seconds_to_timestamp
+from zipline.testing.fixtures import (
+    WithBcolzEquityDailyBarReader,
+    ZiplineTestCase,
+)
+from zipline.utils.calendars import get_calendar
 
 TEST_CALENDAR_START = Timestamp('2015-06-01', tz='UTC')
 TEST_CALENDAR_STOP = Timestamp('2015-06-30', tz='UTC')
@@ -68,62 +74,61 @@ EQUITY_INFO = DataFrame(
     index=arange(1, 7),
     columns=['start_date', 'end_date'],
 ).astype(datetime64)
+EQUITY_INFO['symbol'] = [chr(ord('A') + n) for n in range(len(EQUITY_INFO))]
 
 TEST_QUERY_ASSETS = EQUITY_INFO.index
 
 
-class BcolzDailyBarTestCase(TestCase):
+class BcolzDailyBarTestCase(WithBcolzEquityDailyBarReader, ZiplineTestCase):
+    EQUITY_DAILY_BAR_START_DATE = TEST_CALENDAR_START
+    EQUITY_DAILY_BAR_END_DATE = TEST_CALENDAR_STOP
 
     @classmethod
-    def setUpClass(cls):
-        all_trading_days = TradingEnvironment().trading_days
-        cls.trading_days = all_trading_days[
-            all_trading_days.get_loc(TEST_CALENDAR_START):
-            all_trading_days.get_loc(TEST_CALENDAR_STOP) + 1
-        ]
+    def make_equity_info(cls):
+        return EQUITY_INFO
 
-    def setUp(self):
-
-        self.asset_info = EQUITY_INFO
-        self.writer = SyntheticDailyBarWriter(
-            self.asset_info,
-            self.trading_days,
+    @classmethod
+    def make_equity_daily_bar_data(cls):
+        return make_bar_data(
+            EQUITY_INFO,
+            cls.equity_daily_bar_days,
         )
 
-        self.dir_ = TempDirectory()
-        self.dir_.create()
-        self.dest = self.dir_.getpath('daily_equity_pricing.bcolz')
-
-    def tearDown(self):
-        self.dir_.cleanup()
+    @classmethod
+    def init_class_fixtures(cls):
+        super(BcolzDailyBarTestCase, cls).init_class_fixtures()
+        cls.sessions = cls.trading_calendar.sessions_in_range(
+            cls.trading_calendar.minute_to_session_label(TEST_CALENDAR_START),
+            cls.trading_calendar.minute_to_session_label(TEST_CALENDAR_STOP)
+        )
 
     @property
     def assets(self):
-        return self.asset_info.index
+        return EQUITY_INFO.index
 
     def trading_days_between(self, start, end):
-        return self.trading_days[self.trading_days.slice_indexer(start, end)]
+        return self.sessions[self.sessions.slice_indexer(start, end)]
 
     def asset_start(self, asset_id):
-        return self.writer.asset_start(asset_id)
+        return asset_start(EQUITY_INFO, asset_id)
 
     def asset_end(self, asset_id):
-        return self.writer.asset_end(asset_id)
+        return asset_end(EQUITY_INFO, asset_id)
 
     def dates_for_asset(self, asset_id):
         start, end = self.asset_start(asset_id), self.asset_end(asset_id)
         return self.trading_days_between(start, end)
 
     def test_write_ohlcv_content(self):
-        result = self.writer.write(self.dest, self.trading_days, self.assets)
-        for column in SyntheticDailyBarWriter.OHLCV:
+        result = self.bcolz_daily_bar_ctable
+        for column in OHLCV:
             idx = 0
             data = result[column][:]
             multiplier = 1 if column == 'volume' else 1000
             for asset_id in self.assets:
                 for date in self.dates_for_asset(asset_id):
                     self.assertEqual(
-                        SyntheticDailyBarWriter.expected_value(
+                        expected_bar_value(
                             asset_id,
                             date,
                             column
@@ -134,7 +139,7 @@ class BcolzDailyBarTestCase(TestCase):
             self.assertEqual(idx, len(data))
 
     def test_write_day_and_id(self):
-        result = self.writer.write(self.dest, self.trading_days, self.assets)
+        result = self.bcolz_daily_bar_ctable
         idx = 0
         ids = result['id']
         days = result['day']
@@ -145,7 +150,7 @@ class BcolzDailyBarTestCase(TestCase):
                 idx += 1
 
     def test_write_attrs(self):
-        result = self.writer.write(self.dest, self.trading_days, self.assets)
+        result = self.bcolz_daily_bar_ctable
         expected_first_row = {
             '1': 0,
             '2': 5,   # Asset 1 has 5 trading days.
@@ -176,31 +181,45 @@ class BcolzDailyBarTestCase(TestCase):
             result.attrs['calendar_offset'],
             expected_calendar_offset,
         )
+        cal = get_calendar(result.attrs['calendar_name'])
+        first_session = Timestamp(result.attrs['start_session_ns'], tz='UTC')
+        end_session = Timestamp(result.attrs['end_session_ns'], tz='UTC')
+        sessions = cal.sessions_in_range(first_session, end_session)
+
         assert_index_equal(
-            self.trading_days,
-            DatetimeIndex(result.attrs['calendar'], tz='UTC'),
+            self.sessions,
+            sessions
+        )
+
+    def test_read_first_trading_day(self):
+        self.assertEqual(
+            self.bcolz_equity_daily_bar_reader.first_trading_day,
+            self.sessions[0],
         )
 
     def _check_read_results(self, columns, assets, start_date, end_date):
-        table = self.writer.write(self.dest, self.trading_days, self.assets)
-        reader = BcolzDailyBarReader(table)
-        results = reader.load_raw_arrays(columns, start_date, end_date, assets)
+        results = self.bcolz_equity_daily_bar_reader.load_raw_arrays(
+            columns,
+            start_date,
+            end_date,
+            assets,
+        )
         dates = self.trading_days_between(start_date, end_date)
         for column, result in zip(columns, results):
             assert_array_equal(
                 result,
-                self.writer.expected_values_2d(
+                expected_bar_values_2d(
                     dates,
-                    assets,
-                    column.name,
+                    EQUITY_INFO,
+                    column,
                 )
             )
 
     @parameterized.expand([
-        ([USEquityPricing.open],),
-        ([USEquityPricing.close, USEquityPricing.volume],),
-        ([USEquityPricing.volume, USEquityPricing.high, USEquityPricing.low],),
-        (USEquityPricing.columns,),
+        (['open'],),
+        (['close', 'volume'],),
+        (['volume', 'high', 'low'],),
+        (['open', 'high', 'low', 'close', 'volume'],),
     ])
     def test_read(self, columns):
         self._check_read_results(
@@ -215,13 +234,13 @@ class BcolzDailyBarTestCase(TestCase):
         Test loading with queries that starts on the first day of each asset's
         lifetime.
         """
-        columns = [USEquityPricing.high, USEquityPricing.volume]
+        columns = ['high', 'volume']
         for asset in self.assets:
             self._check_read_results(
                 columns,
                 self.assets,
                 start_date=self.asset_start(asset),
-                end_date=self.trading_days[-1],
+                end_date=self.sessions[-1],
             )
 
     def test_start_on_asset_end(self):
@@ -229,13 +248,13 @@ class BcolzDailyBarTestCase(TestCase):
         Test loading with queries that start on the last day of each asset's
         lifetime.
         """
-        columns = [USEquityPricing.close, USEquityPricing.volume]
+        columns = ['close', 'volume']
         for asset in self.assets:
             self._check_read_results(
                 columns,
                 self.assets,
                 start_date=self.asset_end(asset),
-                end_date=self.trading_days[-1],
+                end_date=self.sessions[-1],
             )
 
     def test_end_on_asset_start(self):
@@ -243,12 +262,12 @@ class BcolzDailyBarTestCase(TestCase):
         Test loading with queries that end on the first day of each asset's
         lifetime.
         """
-        columns = [USEquityPricing.close, USEquityPricing.volume]
+        columns = ['close', 'volume']
         for asset in self.assets:
             self._check_read_results(
                 columns,
                 self.assets,
-                start_date=self.trading_days[0],
+                start_date=self.sessions[0],
                 end_date=self.asset_start(asset),
             )
 
@@ -257,45 +276,44 @@ class BcolzDailyBarTestCase(TestCase):
         Test loading with queries that end on the last day of each asset's
         lifetime.
         """
-        columns = [USEquityPricing.close, USEquityPricing.volume]
+        columns = ['close', 'volume']
         for asset in self.assets:
             self._check_read_results(
                 columns,
                 self.assets,
-                start_date=self.trading_days[0],
+                start_date=self.sessions[0],
                 end_date=self.asset_end(asset),
             )
 
     def test_unadjusted_spot_price(self):
-        table = self.writer.write(self.dest, self.trading_days, self.assets)
-        reader = BcolzDailyBarReader(table)
+        reader = self.bcolz_equity_daily_bar_reader
         # At beginning
         price = reader.spot_price(1, Timestamp('2015-06-01', tz='UTC'),
                                   'close')
         # Synthetic writes price for date.
-        self.assertEqual(135630.0, price)
+        self.assertEqual(108630.0, price)
 
         # Middle
         price = reader.spot_price(1, Timestamp('2015-06-02', tz='UTC'),
                                   'close')
-        self.assertEqual(135631.0, price)
+        self.assertEqual(108631.0, price)
         # End
         price = reader.spot_price(1, Timestamp('2015-06-05', tz='UTC'),
                                   'close')
-        self.assertEqual(135634.0, price)
+        self.assertEqual(108634.0, price)
 
         # Another sid at beginning.
         price = reader.spot_price(2, Timestamp('2015-06-22', tz='UTC'),
                                   'close')
-        self.assertEqual(235651.0, price)
+        self.assertEqual(208651.0, price)
 
         # Ensure that volume does not have float adjustment applied.
         volume = reader.spot_price(1, Timestamp('2015-06-02', tz='UTC'),
                                    'volume')
-        self.assertEqual(145631, volume)
+        self.assertEqual(109631, volume)
 
     def test_unadjusted_spot_price_no_data(self):
-        table = self.writer.write(self.dest, self.trading_days, self.assets)
+        table = self.bcolz_daily_bar_ctable
         reader = BcolzDailyBarReader(table)
         # before
         with self.assertRaises(NoDataOnDate):
@@ -306,18 +324,39 @@ class BcolzDailyBarTestCase(TestCase):
             reader.spot_price(4, Timestamp('2015-06-16', tz='UTC'), 'close')
 
     def test_unadjusted_spot_price_empty_value(self):
-        table = self.writer.write(self.dest, self.trading_days, self.assets)
-        reader = BcolzDailyBarReader(table)
+        reader = self.bcolz_equity_daily_bar_reader
 
         # A sid, day and corresponding index into which to overwrite a zero.
         zero_sid = 1
         zero_day = Timestamp('2015-06-02', tz='UTC')
         zero_ix = reader.sid_day_index(zero_sid, zero_day)
 
-        # Write a zero into the synthetic pricing data at the day and sid,
-        # so that a read should now return -1.
-        # This a little hacky, in lieu of changing the synthetic data set.
-        reader._spot_col('close')[zero_ix] = 0
+        old = reader._spot_col('close')[zero_ix]
+        try:
+            # Write a zero into the synthetic pricing data at the day and sid,
+            # so that a read should now return -1.
+            # This a little hacky, in lieu of changing the synthetic data set.
+            reader._spot_col('close')[zero_ix] = 0
 
-        close = reader.spot_price(zero_sid, zero_day, 'close')
-        self.assertEqual(-1, close)
+            close = reader.spot_price(zero_sid, zero_day, 'close')
+            self.assertEqual(-1, close)
+        finally:
+            reader._spot_col('close')[zero_ix] = old
+
+
+class BcolzDailyBarAlwaysReadAllTestCase(BcolzDailyBarTestCase):
+    """
+    Force tests defined in BcolzDailyBarTestCase to always read the entire
+    column into memory before selecting desired asset data, when invoking
+    `load_raw_array`.
+    """
+    BCOLZ_DAILY_BAR_READ_ALL_THRESHOLD = 0
+
+
+class BcolzDailyBarNeverReadAllTestCase(BcolzDailyBarTestCase):
+    """
+    Force tests defined in BcolzDailyBarTestCase to never read the entire
+    column into memory before selecting desired asset data, when invoking
+    `load_raw_array`.
+    """
+    BCOLZ_DAILY_BAR_READ_ALL_THRESHOLD = maxsize

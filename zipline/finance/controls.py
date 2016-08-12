@@ -115,18 +115,16 @@ class MaxOrderCount(TradingControl):
 
 
 class RestrictedListOrder(TradingControl):
-    """
-    TradingControl representing a restricted list of assets that
+    """TradingControl representing a restricted list of assets that
     cannot be ordered by the algorithm.
+
+    Parameters
+    ----------
+    restricted_list : container[Asset]
+        The assets that cannot be ordered.
     """
 
     def __init__(self, restricted_list):
-        """
-        restricted list can be an iterable or a
-        container (implements __contains__) for dynamic
-        restrictions.
-        """
-
         super(RestrictedListOrder, self).__init__()
         self.restricted_list = restricted_list
 
@@ -190,7 +188,7 @@ class MaxOrderSize(TradingControl):
         if self.max_shares is not None and abs(amount) > self.max_shares:
             self.fail(asset, amount, _algo_datetime)
 
-        current_asset_price = algo_current_data[asset].price
+        current_asset_price = algo_current_data.current(asset, "price")
         order_value = amount * current_asset_price
 
         too_much_value = (self.max_notional is not None and
@@ -252,7 +250,7 @@ class MaxPositionSize(TradingControl):
         if too_many_shares:
             self.fail(asset, amount, algo_datetime)
 
-        current_price = algo_current_data[asset].price
+        current_price = algo_current_data.current(asset, "price")
         value_post_order = shares_post_order * current_price
 
         too_much_value = (self.max_notional is not None and

@@ -5,21 +5,43 @@ from collections import Counter
 from itertools import product
 from unittest import TestCase
 
+from toolz import assoc
+
+from zipline.assets import Asset
 from zipline.errors import (
     DTypeNotSpecified,
-    WindowedInputToWindowedTerm,
+    InvalidOutputName,
+    NonWindowSafeInput,
     NotDType,
     TermInputsNotSpecified,
+    TermOutputsEmpty,
     UnsupportedDType,
     WindowLengthNotSpecified,
 )
-from zipline.pipeline import Classifier, Factor, Filter, TermGraph
+from zipline.pipeline import (
+    Classifier,
+    CustomClassifier,
+    CustomFactor,
+    Factor,
+    Filter,
+    TermGraph,
+)
 from zipline.pipeline.data import Column, DataSet
 from zipline.pipeline.data.testing import TestingDataSet
-from zipline.pipeline.term import AssetExists, NotSpecified
 from zipline.pipeline.expression import NUMEXPR_MATH_FUNCS
+from zipline.pipeline.factors import RecarrayField
+from zipline.pipeline.sentinels import NotSpecified
+from zipline.pipeline.term import AssetExists, Slice
+from zipline.testing import parameter_space
+from zipline.testing.predicates import (
+    assert_equal,
+    assert_raises,
+    assert_raises_regex,
+    assert_regex,
+)
 from zipline.utils.numpy_utils import (
     bool_dtype,
+    categorical_dtype,
     complex128_dtype,
     datetime64ns_dtype,
     float64_dtype,
@@ -67,6 +89,34 @@ class NoLookbackFactor(Factor):
     window_length = 0
 
 
+class GenericCustomFactor(CustomFactor):
+    dtype = float64_dtype
+    window_length = 5
+    inputs = [SomeDataSet.foo]
+
+
+class MultipleOutputs(CustomFactor):
+    dtype = float64_dtype
+    window_length = 5
+    inputs = [SomeDataSet.foo, SomeDataSet.bar]
+    outputs = ['alpha', 'beta']
+
+    def some_method(self):
+        return
+
+
+class GenericFilter(Filter):
+    dtype = bool_dtype
+    window_length = 0
+    inputs = []
+
+
+class GenericClassifier(Classifier):
+    dtype = categorical_dtype
+    window_length = 0
+    inputs = []
+
+
 def gen_equivalent_factors():
     """
     Return an iterator of SomeFactor instances that should all be the same
@@ -96,7 +146,7 @@ def to_dict(l):
 
     Example
     -------
-    >>> to_dict([2, 3, 4])
+    >>> to_dict([2, 3, 4])  # doctest: +SKIP
     {'0': 2, '1': 3, '2': 4}
     """
     return dict(zip(map(str, range(len(l))), l))
@@ -174,7 +224,7 @@ class DependencyResolutionTestCase(TestCase):
 
     def test_disallow_recursive_lookback(self):
 
-        with self.assertRaises(WindowedInputToWindowedTerm):
+        with self.assertRaises(NonWindowSafeInput):
             SomeFactor(inputs=[SomeFactor(), SomeDataSet.foo])
 
 
@@ -210,6 +260,50 @@ class ObjectIdentityTestCase(TestCase):
             SomeFactor(inputs=[SomeFactor.inputs[1], SomeFactor.inputs[0]]),
         )
 
+        mask = SomeFactor() + SomeOtherFactor()
+        self.assertIs(SomeFactor(mask=mask), SomeFactor(mask=mask))
+
+    def test_instance_caching_multiple_outputs(self):
+        self.assertIs(MultipleOutputs(), MultipleOutputs())
+        self.assertIs(
+            MultipleOutputs(),
+            MultipleOutputs(outputs=MultipleOutputs.outputs),
+        )
+        self.assertIs(
+            MultipleOutputs(
+                outputs=[
+                    MultipleOutputs.outputs[1], MultipleOutputs.outputs[0],
+                ],
+            ),
+            MultipleOutputs(
+                outputs=[
+                    MultipleOutputs.outputs[1], MultipleOutputs.outputs[0],
+                ],
+            ),
+        )
+
+        # Ensure that both methods of accessing our outputs return the same
+        # things.
+        multiple_outputs = MultipleOutputs()
+        alpha, beta = MultipleOutputs()
+        self.assertIs(alpha, multiple_outputs.alpha)
+        self.assertIs(beta, multiple_outputs.beta)
+
+    def test_instance_caching_of_slices(self):
+        my_asset = Asset(1, exchange="TEST")
+
+        f = GenericCustomFactor()
+        f_slice = f[my_asset]
+        self.assertIs(f_slice, Slice(GenericCustomFactor(), my_asset))
+
+        f = GenericFilter()
+        f_slice = f[my_asset]
+        self.assertIs(f_slice, Slice(GenericFilter(), my_asset))
+
+        c = GenericClassifier()
+        c_slice = c[my_asset]
+        self.assertIs(c_slice, Slice(GenericClassifier(), my_asset))
+
     def test_instance_non_caching(self):
 
         f = SomeFactor()
@@ -242,6 +336,30 @@ class ObjectIdentityTestCase(TestCase):
             inputs = [SomeDataSet.foo, SomeDataSet.bar]
 
         self.assertIsNot(orig_foobar_instance, SomeFactor())
+
+    def test_instance_non_caching_multiple_outputs(self):
+        multiple_outputs = MultipleOutputs()
+
+        # Different outputs.
+        self.assertIsNot(
+            MultipleOutputs(), MultipleOutputs(outputs=['beta', 'gamma']),
+        )
+
+        # Reordering outputs.
+        self.assertIsNot(
+            multiple_outputs,
+            MultipleOutputs(
+                outputs=[
+                    MultipleOutputs.outputs[1], MultipleOutputs.outputs[0],
+                ],
+            ),
+        )
+
+        # Different factors sharing an output name should produce different
+        # RecarrayField factors.
+        orig_beta = multiple_outputs.beta
+        beta, gamma = MultipleOutputs(outputs=['beta', 'gamma'])
+        self.assertIsNot(beta, orig_beta)
 
     def test_instance_caching_binops(self):
         f = SomeFactor()
@@ -282,26 +400,102 @@ class ObjectIdentityTestCase(TestCase):
             method = getattr(f, funcname)
             self.assertIs(method(), method())
 
+    def test_instance_caching_grouped_transforms(self):
+        f = SomeFactor()
+        c = GenericClassifier()
+        m = GenericFilter()
+
+        for meth in f.demean, f.zscore, f.rank:
+            self.assertIs(meth(), meth())
+            self.assertIs(meth(groupby=c), meth(groupby=c))
+            self.assertIs(meth(mask=m), meth(mask=m))
+            self.assertIs(meth(groupby=c, mask=m), meth(groupby=c, mask=m))
+
+    class SomeFactorParameterized(SomeFactor):
+        params = ('a', 'b')
+
     def test_parameterized_term(self):
 
-        class SomeFactorParameterized(SomeFactor):
-            params = ('a', 'b')
-
-        f = SomeFactorParameterized(a=1, b=2)
+        f = self.SomeFactorParameterized(a=1, b=2)
         self.assertEqual(f.params, {'a': 1, 'b': 2})
 
-        g = SomeFactorParameterized(a=1, b=3)
-        h = SomeFactorParameterized(a=2, b=2)
+        g = self.SomeFactorParameterized(a=1, b=3)
+        h = self.SomeFactorParameterized(a=2, b=2)
         self.assertDifferentObjects(f, g, h)
 
-        f2 = SomeFactorParameterized(a=1, b=2)
-        f3 = SomeFactorParameterized(b=2, a=1)
+        f2 = self.SomeFactorParameterized(a=1, b=2)
+        f3 = self.SomeFactorParameterized(b=2, a=1)
         self.assertSameObject(f, f2, f3)
 
         self.assertEqual(f.params['a'], 1)
         self.assertEqual(f.params['b'], 2)
         self.assertEqual(f.window_length, SomeFactor.window_length)
         self.assertEqual(f.inputs, tuple(SomeFactor.inputs))
+
+    def test_parameterized_term_non_hashable_arg(self):
+        with assert_raises(TypeError) as e:
+            self.SomeFactorParameterized(a=[], b=1)
+        assert_equal(
+            str(e.exception),
+            "SomeFactorParameterized expected a hashable value for parameter"
+            " 'a', but got [] instead.",
+        )
+
+        with assert_raises(TypeError) as e:
+            self.SomeFactorParameterized(a=1, b=[])
+        assert_equal(
+            str(e.exception),
+            "SomeFactorParameterized expected a hashable value for parameter"
+            " 'b', but got [] instead.",
+        )
+
+        with assert_raises(TypeError) as e:
+            self.SomeFactorParameterized(a=[], b=[])
+        assert_regex(
+            str(e.exception),
+            r"SomeFactorParameterized expected a hashable value for parameter"
+            r" '(a|b)', but got \[\] instead\.",
+        )
+
+    def test_parameterized_term_default_value(self):
+        defaults = {'a': 'default for a', 'b': 'default for b'}
+
+        class F(Factor):
+            params = defaults
+
+            inputs = (SomeDataSet.foo,)
+            dtype = 'f8'
+            window_length = 5
+
+        assert_equal(F().params, defaults)
+        assert_equal(F(a='new a').params, assoc(defaults, 'a', 'new a'))
+        assert_equal(F(b='new b').params, assoc(defaults, 'b', 'new b'))
+        assert_equal(
+            F(a='new a', b='new b').params,
+            {'a': 'new a', 'b': 'new b'},
+        )
+
+    def test_parameterized_term_default_value_with_not_specified(self):
+        defaults = {'a': 'default for a', 'b': NotSpecified}
+
+        class F(Factor):
+            params = defaults
+
+            inputs = (SomeDataSet.foo,)
+            dtype = 'f8'
+            window_length = 5
+
+        pattern = r"F expected a keyword parameter 'b'\."
+        with assert_raises_regex(TypeError, pattern):
+            F()
+        with assert_raises_regex(TypeError, pattern):
+            F(a='new a')
+
+        assert_equal(F(b='new b').params, assoc(defaults, 'b', 'new b'))
+        assert_equal(
+            F(a='new a', b='new b').params,
+            {'a': 'new a', 'b': 'new b'},
+        )
 
     def test_bad_input(self):
 
@@ -343,6 +537,52 @@ class ObjectIdentityTestCase(TestCase):
         with self.assertRaises(UnsupportedDType):
             SomeFactor(dtype=complex128_dtype)
 
+        with self.assertRaises(TermOutputsEmpty):
+            MultipleOutputs(outputs=[])
+
+    def test_bad_output_access(self):
+        with self.assertRaises(AttributeError) as e:
+            SomeFactor().not_an_attr
+
+        errmsg = str(e.exception)
+        self.assertEqual(
+            errmsg, "'SomeFactor' object has no attribute 'not_an_attr'",
+        )
+
+        mo = MultipleOutputs()
+        with self.assertRaises(AttributeError) as e:
+            mo.not_an_attr
+
+        errmsg = str(e.exception)
+        expected = (
+            "Instance of MultipleOutputs has no output named 'not_an_attr'."
+            " Possible choices are: ('alpha', 'beta')."
+        )
+        self.assertEqual(errmsg, expected)
+
+        with self.assertRaises(ValueError) as e:
+            alpha, beta = GenericCustomFactor()
+
+        errmsg = str(e.exception)
+        self.assertEqual(
+            errmsg, "GenericCustomFactor does not have multiple outputs.",
+        )
+
+        # Public method, user-defined method.
+        # Accessing these attributes should return the output, not the method.
+        conflicting_output_names = ['zscore', 'some_method']
+
+        mo = MultipleOutputs(outputs=conflicting_output_names)
+        for name in conflicting_output_names:
+            self.assertIsInstance(getattr(mo, name), RecarrayField)
+
+        # Non-callable attribute, private method, special method.
+        disallowed_output_names = ['inputs', '_init', '__add__']
+
+        for name in disallowed_output_names:
+            with self.assertRaises(InvalidOutputName):
+                GenericCustomFactor(outputs=[name])
+
     def test_require_super_call_in_validate(self):
 
         class MyFactor(Factor):
@@ -369,7 +609,8 @@ class ObjectIdentityTestCase(TestCase):
         for column in TestingDataSet.columns:
             if column.dtype == bool_dtype:
                 self.assertIsInstance(column.latest, Filter)
-            elif column.dtype == int64_dtype:
+            elif (column.dtype == int64_dtype
+                  or column.dtype.kind in ('O', 'S', 'U')):
                 self.assertIsInstance(column.latest, Classifier)
             elif column.dtype in factor_dtypes:
                 self.assertIsInstance(column.latest, Factor)
@@ -466,3 +707,56 @@ class SubDataSetTestCase(TestCase):
                 'subclass column %r should have the same dtype as the parent' %
                 k,
             )
+
+    @parameter_space(
+        dtype_=[categorical_dtype, int64_dtype],
+        outputs_=[('a',), ('a', 'b')],
+    )
+    def test_reject_multi_output_classifiers(self, dtype_, outputs_):
+        """
+        Multi-output CustomClassifiers don't work because they use special
+        output allocation for string arrays.
+        """
+
+        class SomeClassifier(CustomClassifier):
+            dtype = dtype_
+            window_length = 5
+            inputs = [SomeDataSet.foo, SomeDataSet.bar]
+            outputs = outputs_
+            missing_value = dtype_.type('123')
+
+        expected_error = (
+            "SomeClassifier does not support custom outputs, "
+            "but received custom outputs={outputs}.".format(outputs=outputs_)
+        )
+
+        with self.assertRaises(ValueError) as e:
+            SomeClassifier()
+        self.assertEqual(str(e.exception), expected_error)
+
+        with self.assertRaises(ValueError) as e:
+            SomeClassifier()
+        self.assertEqual(str(e.exception), expected_error)
+
+    def test_unreasonable_missing_values(self):
+
+        for base_type, dtype_, bad_mv in ((Factor, float64_dtype, 'ayy'),
+                                          (Filter, bool_dtype, 'lmao'),
+                                          (Classifier, int64_dtype, 'lolwut'),
+                                          (Classifier, categorical_dtype, 7)):
+            class SomeTerm(base_type):
+                inputs = ()
+                window_length = 0
+                missing_value = bad_mv
+                dtype = dtype_
+
+            with self.assertRaises(TypeError) as e:
+                SomeTerm()
+
+            prefix = (
+                "^Missing value {mv!r} is not a valid choice "
+                "for term SomeTerm with dtype {dtype}.\n\n"
+                "Coercion attempt failed with:"
+            ).format(mv=bad_mv, dtype=dtype_)
+
+            self.assertRegexpMatches(str(e.exception), prefix)

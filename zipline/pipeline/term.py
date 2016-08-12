@@ -2,33 +2,43 @@
 Base class for Filters, Factors and Classifiers
 """
 from abc import ABCMeta, abstractproperty
+from bisect import insort
+from collections import Mapping
 from weakref import WeakValueDictionary
 
-from numpy import dtype as dtype_class
+from numpy import (
+    array,
+    dtype as dtype_class,
+    ndarray,
+    searchsorted,
+)
 from six import with_metaclass
+
+from zipline.assets import Asset
 from zipline.errors import (
     DTypeNotSpecified,
-    WindowedInputToWindowedTerm,
+    InvalidOutputName,
+    NonExistentAssetInTimeFrame,
+    NonSliceableTerm,
+    NonWindowSafeInput,
     NotDType,
     TermInputsNotSpecified,
+    TermOutputsEmpty,
     UnsupportedDType,
     WindowLengthNotSpecified,
 )
 from zipline.lib.adjusted_array import can_represent_dtype
+from zipline.lib.labelarray import LabelArray
+from zipline.utils.input_validation import expect_types
 from zipline.utils.memoize import lazyval
 from zipline.utils.numpy_utils import (
     bool_dtype,
+    categorical_dtype,
     default_missing_value_for_dtype,
 )
-from zipline.utils.sentinel import sentinel
 
-
-NotSpecified = sentinel(
-    'NotSpecified',
-    'Singleton sentinel value used for Term defaults.',
-)
-
-NotSpecifiedType = type(NotSpecified)
+from .mixins import SingleInputMixin
+from .sentinels import NotSpecified
 
 
 class Term(with_metaclass(ABCMeta, object)):
@@ -44,12 +54,20 @@ class Term(with_metaclass(ABCMeta, object)):
     # no params.
     params = ()
 
+    # Determines if a term is safe to be used as a windowed input.
+    window_safe = False
+
+    # The dimensions of the term's output (1D or 2D).
+    ndim = 2
+
     _term_cache = WeakValueDictionary()
 
     def __new__(cls,
                 domain=domain,
                 dtype=dtype,
                 missing_value=missing_value,
+                window_safe=NotSpecified,
+                ndim=NotSpecified,
                 # params is explicitly not allowed to be passed to an instance.
                 *args,
                 **kwargs):
@@ -71,18 +89,24 @@ class Term(with_metaclass(ABCMeta, object)):
             dtype = cls.dtype
         if missing_value is NotSpecified:
             missing_value = cls.missing_value
+        if ndim is NotSpecified:
+            ndim = cls.ndim
+        if window_safe is NotSpecified:
+            window_safe = cls.window_safe
 
-        dtype, missing_value = cls.validate_dtype(
+        dtype, missing_value = validate_dtype(
             cls.__name__,
             dtype,
             missing_value,
         )
         params = cls._pop_params(kwargs)
 
-        identity = cls.static_identity(
+        identity = cls._static_identity(
             domain=domain,
             dtype=dtype,
             missing_value=missing_value,
+            window_safe=window_safe,
+            ndim=ndim,
             params=params,
             *args, **kwargs
         )
@@ -95,6 +119,8 @@ class Term(with_metaclass(ABCMeta, object)):
                     domain=domain,
                     dtype=dtype,
                     missing_value=missing_value,
+                    window_safe=window_safe,
+                    ndim=ndim,
                     params=params,
                     *args, **kwargs
                 )
@@ -121,14 +147,19 @@ class Term(with_metaclass(ABCMeta, object)):
         TypeError
             Raised if any parameter values are not passed or not hashable.
         """
+        params = cls.params
+        if not isinstance(params, Mapping):
+            params = {k: NotSpecified for k in params}
         param_values = []
-        for key in cls.params:
+        for key, default_value in params.items():
             try:
-                value = kwargs.pop(key)
+                value = kwargs.pop(key, default_value)
+                if value is NotSpecified:
+                    raise KeyError(key)
+
                 # Check here that the value is hashable so that we fail here
                 # instead of trying to hash the param values tuple later.
-                hash(key)
-                param_values.append(value)
+                hash(value)
             except KeyError:
                 raise TypeError(
                     "{typename} expected a keyword parameter {name!r}.".format(
@@ -146,47 +177,9 @@ class Term(with_metaclass(ABCMeta, object)):
                         value=value,
                     )
                 )
-        return tuple(zip(cls.params, param_values))
 
-    @staticmethod
-    def validate_dtype(termname, dtype, missing_value):
-        """
-        Validate a `dtype` and `missing_value` passed to Term.__new__.
-
-        Ensures that we know how to represent ``dtype``, and that missing_value
-        is specified for types without default missing values.
-
-        Returns
-        -------
-        validated_dtype, validated_missing_value : np.dtype, any
-            The dtype and missing_value to use for the new term.
-
-        Raises
-        ------
-        DTypeNotSpecified
-            When no dtype was passed to the instance, and the class doesn't
-            provide a default.
-        NotDType
-            When either the class or the instance provides a value not
-            coercible to a numpy dtype.
-        NoDefaultMissingValue
-            When dtype requires an explicit missing_value, but
-            ``missing_value`` is NotSpecified.
-        """
-        if dtype is NotSpecified:
-            raise DTypeNotSpecified(termname=termname)
-        try:
-            dtype = dtype_class(dtype)
-        except TypeError:
-            raise NotDType(dtype=dtype, termname=termname)
-
-        if not can_represent_dtype(dtype):
-            raise UnsupportedDType(dtype=dtype, termname=termname)
-
-        if missing_value is NotSpecified:
-            missing_value = default_missing_value_for_dtype(dtype)
-
-        return dtype, missing_value
+            param_values.append((key, value))
+        return tuple(param_values)
 
     def __init__(self, *args, **kwargs):
         """
@@ -204,8 +197,20 @@ class Term(with_metaclass(ABCMeta, object)):
         """
         pass
 
+    @expect_types(key=Asset)
+    def __getitem__(self, key):
+        if isinstance(self, LoadableTerm):
+            raise NonSliceableTerm(term=self)
+        return Slice(self, key)
+
     @classmethod
-    def static_identity(cls, domain, dtype, missing_value, params):
+    def _static_identity(cls,
+                         domain,
+                         dtype,
+                         missing_value,
+                         window_safe,
+                         ndim,
+                         params):
         """
         Return the identity of the Term that would be constructed from the
         given arguments.
@@ -217,9 +222,9 @@ class Term(with_metaclass(ABCMeta, object)):
         This is a classmethod so that it can be called from Term.__new__ to
         determine whether to produce a new instance.
         """
-        return (cls, domain, dtype, missing_value, params)
+        return (cls, domain, dtype, missing_value, window_safe, ndim, params)
 
-    def _init(self, domain, dtype, missing_value, params):
+    def _init(self, domain, dtype, missing_value, window_safe, ndim, params):
         """
         Parameters
         ----------
@@ -233,12 +238,14 @@ class Term(with_metaclass(ABCMeta, object)):
         self.domain = domain
         self.dtype = dtype
         self.missing_value = missing_value
+        self.window_safe = window_safe
+        self.ndim = ndim
 
         for name, value in params:
             if hasattr(self, name):
                 raise TypeError(
                     "Parameter {name!r} conflicts with already-present"
-                    "attribute with value {value!r}.".format(
+                    " attribute with value {value!r}.".format(
                         name=name,
                         value=getattr(self, name),
                     )
@@ -294,13 +301,13 @@ class Term(with_metaclass(ABCMeta, object)):
         """
         raise NotImplementedError('mask')
 
-    @lazyval
+    @abstractproperty
     def dependencies(self):
         """
-        A tuple containing all terms that must be computed before this term can
-        be loaded or computed.
+        A dictionary mapping terms that must be computed before `self` to the
+        number of extra rows needed for those terms.
         """
-        return self.inputs + (self.mask,)
+        raise NotImplementedError('dependencies')
 
 
 class AssetExists(Term):
@@ -319,9 +326,8 @@ class AssetExists(Term):
     """
     dtype = bool_dtype
     dataset = None
-    extra_input_rows = 0
     inputs = ()
-    dependencies = ()
+    dependencies = {}
     mask = None
     windowed = False
 
@@ -335,8 +341,11 @@ class LoadableTerm(Term):
 
     This is the base class for :class:`zipline.pipeline.data.BoundColumn`.
     """
-    inputs = ()
     windowed = False
+
+    @lazyval
+    def dependencies(self):
+        return {self.mask: 0}
 
 
 class ComputableTerm(Term):
@@ -347,11 +356,13 @@ class ComputableTerm(Term):
     :class:`zipline.pipeline.Filter`, and :class:`zipline.pipeline.Factor`.
     """
     inputs = NotSpecified
+    outputs = NotSpecified
     window_length = NotSpecified
     mask = NotSpecified
 
     def __new__(cls,
                 inputs=inputs,
+                outputs=outputs,
                 window_length=window_length,
                 mask=mask,
                 *args, **kwargs):
@@ -366,6 +377,11 @@ class ComputableTerm(Term):
             # normalize to a tuple so that inputs is hashable.
             inputs = tuple(inputs)
 
+        if outputs is NotSpecified:
+            outputs = cls.outputs
+        if outputs is not NotSpecified:
+            outputs = tuple(outputs)
+
         if mask is NotSpecified:
             mask = cls.mask
         if mask is NotSpecified:
@@ -377,22 +393,31 @@ class ComputableTerm(Term):
         return super(ComputableTerm, cls).__new__(
             cls,
             inputs=inputs,
+            outputs=outputs,
             mask=mask,
             window_length=window_length,
             *args, **kwargs
         )
 
-    def _init(self, inputs, window_length, mask, *args, **kwargs):
+    def _init(self, inputs, outputs, window_length, mask, *args, **kwargs):
         self.inputs = inputs
+        self.outputs = outputs
         self.window_length = window_length
         self.mask = mask
         return super(ComputableTerm, self)._init(*args, **kwargs)
 
     @classmethod
-    def static_identity(cls, inputs, window_length, mask, *args, **kwargs):
+    def _static_identity(cls,
+                         inputs,
+                         outputs,
+                         window_length,
+                         mask,
+                         *args,
+                         **kwargs):
         return (
-            super(ComputableTerm, cls).static_identity(*args, **kwargs),
+            super(ComputableTerm, cls)._static_identity(*args, **kwargs),
             inputs,
+            outputs,
             window_length,
             mask,
         )
@@ -403,6 +428,30 @@ class ComputableTerm(Term):
         if self.inputs is NotSpecified:
             raise TermInputsNotSpecified(termname=type(self).__name__)
 
+        if self.outputs is NotSpecified:
+            pass
+        elif not self.outputs:
+            raise TermOutputsEmpty(termname=type(self).__name__)
+        else:
+            # Raise an exception if there are any naming conflicts between the
+            # term's output names and certain attributes.
+            disallowed_names = [
+                attr for attr in dir(ComputableTerm)
+                if not attr.startswith('_')
+            ]
+
+            # The name 'compute' is an added special case that is disallowed.
+            # Use insort to add it to the list in alphabetical order.
+            insort(disallowed_names, 'compute')
+
+            for output in self.outputs:
+                if output.startswith('_') or output in disallowed_names:
+                    raise InvalidOutputName(
+                        output_name=output,
+                        termname=type(self).__name__,
+                        disallowed_names=disallowed_names,
+                    )
+
         if self.window_length is NotSpecified:
             raise WindowLengthNotSpecified(termname=type(self).__name__)
 
@@ -412,8 +461,8 @@ class ComputableTerm(Term):
 
         if self.window_length:
             for child in self.inputs:
-                if child.windowed:
-                    raise WindowedInputToWindowedTerm(parent=self, child=child)
+                if not child.window_safe:
+                    raise NonWindowSafeInput(parent=self, child=child)
 
     def _compute(self, inputs, dates, assets, mask):
         """
@@ -442,12 +491,30 @@ class ComputableTerm(Term):
         )
 
     @lazyval
-    def extra_input_rows(self):
+    def dependencies(self):
         """
         The number of extra rows needed for each of our inputs to compute this
         term.
         """
-        return max(0, self.window_length - 1)
+        extra_input_rows = max(0, self.window_length - 1)
+        out = {}
+        for term in self.inputs:
+            out[term] = extra_input_rows
+        out[self.mask] = 0
+        return out
+
+    @expect_types(data=ndarray)
+    def postprocess(self, data):
+        """
+        Called with an result of ``self``, unravelled (i.e. 1-dimensional)
+        after any user-defined screens have been applied.
+
+        This is mostly useful for transforming the dtype of an output, e.g., to
+        convert a LabelArray into a pandas Categorical.
+
+        The default implementation is to just return data unchanged.
+        """
+        return data
 
     def __repr__(self):
         return (
@@ -456,4 +523,144 @@ class ComputableTerm(Term):
             type=type(self).__name__,
             inputs=self.inputs,
             window_length=self.window_length,
+        )
+
+
+class Slice(ComputableTerm, SingleInputMixin):
+    """
+    Term for extracting a single column of a another term's output.
+
+    Parameters
+    ----------
+    term : zipline.pipeline.term.Term
+        The term from which to extract a column of data.
+    asset : zipline.assets.Asset
+        The asset corresponding to the column of `term` to be extracted.
+
+    Notes
+    -----
+    Users should rarely construct instances of `Slice` directly. Instead, they
+    should construct instances via indexing, e.g. `MyFactor()[Asset(24)]`.
+    """
+    def __new__(cls, term, asset):
+        return super(Slice, cls).__new__(
+            cls,
+            asset=asset,
+            inputs=[term],
+            window_length=0,
+            mask=term.mask,
+            dtype=term.dtype,
+            missing_value=term.missing_value,
+            window_safe=term.window_safe,
+            ndim=1,
+        )
+
+    def __repr__(self):
+        return "{type}({parent_term}, column={asset})".format(
+            type=type(self).__name__,
+            parent_term=type(self.inputs[0]).__name__,
+            asset=self._asset,
+        )
+
+    def _init(self, asset, *args, **kwargs):
+        self._asset = asset
+        return super(Slice, self)._init(*args, **kwargs)
+
+    @classmethod
+    def _static_identity(cls, asset, *args, **kwargs):
+        return (super(Slice, cls)._static_identity(*args, **kwargs), asset)
+
+    def _compute(self, windows, dates, assets, mask):
+        asset = self._asset
+        asset_column = searchsorted(assets.values, asset.sid)
+        if assets[asset_column] != asset.sid:
+            raise NonExistentAssetInTimeFrame(
+                asset=asset, start_date=dates[0], end_date=dates[-1],
+            )
+
+        # Return a 2D array with one column rather than a 1D array of the
+        # column.
+        return windows[0][:, [asset_column]]
+
+
+def validate_dtype(termname, dtype, missing_value):
+    """
+    Validate a `dtype` and `missing_value` passed to Term.__new__.
+
+    Ensures that we know how to represent ``dtype``, and that missing_value
+    is specified for types without default missing values.
+
+    Returns
+    -------
+    validated_dtype, validated_missing_value : np.dtype, any
+        The dtype and missing_value to use for the new term.
+
+    Raises
+    ------
+    DTypeNotSpecified
+        When no dtype was passed to the instance, and the class doesn't
+        provide a default.
+    NotDType
+        When either the class or the instance provides a value not
+        coercible to a numpy dtype.
+    NoDefaultMissingValue
+        When dtype requires an explicit missing_value, but
+        ``missing_value`` is NotSpecified.
+    """
+    if dtype is NotSpecified:
+        raise DTypeNotSpecified(termname=termname)
+
+    try:
+        dtype = dtype_class(dtype)
+    except TypeError:
+        raise NotDType(dtype=dtype, termname=termname)
+
+    if not can_represent_dtype(dtype):
+        raise UnsupportedDType(dtype=dtype, termname=termname)
+
+    if missing_value is NotSpecified:
+        missing_value = default_missing_value_for_dtype(dtype)
+
+    try:
+        if (dtype == categorical_dtype):
+            # This check is necessary because we use object dtype for
+            # categoricals, and numpy will allow us to promote numerical
+            # values to object even though we don't support them.
+            _assert_valid_categorical_missing_value(missing_value)
+
+        # For any other type, we can check if the missing_value is safe by
+        # making an array of that value and trying to safely convert it to
+        # the desired type.
+        # 'same_kind' allows casting between things like float32 and
+        # float64, but not str and int.
+        array([missing_value]).astype(dtype=dtype, casting='same_kind')
+    except TypeError as e:
+        raise TypeError(
+            "Missing value {value!r} is not a valid choice "
+            "for term {termname} with dtype {dtype}.\n\n"
+            "Coercion attempt failed with: {error}".format(
+                termname=termname,
+                value=missing_value,
+                dtype=dtype,
+                error=e,
+            )
+        )
+
+    return dtype, missing_value
+
+
+def _assert_valid_categorical_missing_value(value):
+    """
+    Check that value is a valid categorical missing_value.
+
+    Raises a TypeError if the value is cannot be used as the missing_value for
+    a categorical_dtype Term.
+    """
+    label_types = LabelArray.SUPPORTED_SCALAR_TYPES
+    if not isinstance(value, label_types):
+        raise TypeError(
+            "Categorical terms must have missing values of type "
+            "{types}.".format(
+                types=' or '.join([t.__name__ for t in label_types]),
+            )
         )

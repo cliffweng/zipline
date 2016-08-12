@@ -1,12 +1,16 @@
 """
 Mixins classes for use with Filters and Factors.
 """
-from numpy import full_like
+from numpy import (
+    array,
+    full,
+    recarray,
+)
 
 from zipline.utils.control_flow import nullctx
 from zipline.errors import WindowLengthNotPositive, UnsupportedDataType
 
-from .term import NotSpecified
+from .sentinels import NotSpecified
 
 
 class PositiveWindowLengthMixin(object):
@@ -36,6 +40,22 @@ class SingleInputMixin(object):
             )
 
 
+class StandardOutputs(object):
+    """
+    Validation mixin enforcing that a Term cannot produce non-standard outputs.
+    """
+    def _validate(self):
+        super(StandardOutputs, self)._validate()
+        if self.outputs is not NotSpecified:
+            raise ValueError(
+                "{typename} does not support custom outputs,"
+                " but received custom outputs={outputs}.".format(
+                    typename=type(self).__name__,
+                    outputs=self.outputs,
+                )
+            )
+
+
 class RestrictedDTypeMixin(object):
     """
     Validation mixin enforcing that a term has a specific dtype.
@@ -51,7 +71,7 @@ class RestrictedDTypeMixin(object):
 
         if self.dtype not in self.ALLOWED_DTYPES:
             raise UnsupportedDataType(
-                typename=type(self.__name__),
+                typename=type(self).__name__,
                 dtype=self.dtype,
             )
 
@@ -69,9 +89,12 @@ class CustomTermMixin(object):
 
     def __new__(cls,
                 inputs=NotSpecified,
+                outputs=NotSpecified,
                 window_length=NotSpecified,
+                mask=NotSpecified,
                 dtype=NotSpecified,
                 missing_value=NotSpecified,
+                ndim=NotSpecified,
                 **kwargs):
 
         unexpected_keys = set(kwargs) - set(cls.params)
@@ -87,9 +110,12 @@ class CustomTermMixin(object):
         return super(CustomTermMixin, cls).__new__(
             cls,
             inputs=inputs,
+            outputs=outputs,
             window_length=window_length,
+            mask=mask,
             dtype=dtype,
             missing_value=missing_value,
+            ndim=ndim,
             **kwargs
         )
 
@@ -99,28 +125,73 @@ class CustomTermMixin(object):
         """
         raise NotImplementedError()
 
+    def _allocate_output(self, windows, shape):
+        """
+        Allocate an output array whose rows should be passed to `self.compute`.
+
+        The resulting array must have a shape of ``shape``.
+
+        If we have standard outputs (i.e. self.outputs is NotSpecified), the
+        default is an empty ndarray whose dtype is ``self.dtype``.
+
+        If we have an outputs tuple, the default is an empty recarray with
+        ``self.outputs`` as field names. Each field will have dtype
+        ``self.dtype``.
+
+        This can be overridden to control the kind of array constructed
+        (e.g. to produce a LabelArray instead of an ndarray).
+        """
+        missing_value = self.missing_value
+        outputs = self.outputs
+        if outputs is not NotSpecified:
+            out = recarray(
+                shape,
+                formats=[self.dtype.str] * len(outputs),
+                names=outputs,
+            )
+            out[:] = missing_value
+        else:
+            out = full(shape, missing_value, dtype=self.dtype)
+        return out
+
+    def _format_inputs(self, windows, column_mask):
+        inputs = []
+        for input_ in windows:
+            window = next(input_)
+            if window.shape[1] == 1:
+                # Do not mask single-column inputs.
+                inputs.append(window)
+            else:
+                inputs.append(window[:, column_mask])
+        return inputs
+
     def _compute(self, windows, dates, assets, mask):
         """
         Call the user's `compute` function on each window with a pre-built
         output array.
         """
-        # TODO: Make mask available to user's `compute`.
+        format_inputs = self._format_inputs
         compute = self.compute
-        missing_value = self.missing_value
         params = self.params
-        out = full_like(mask, missing_value, dtype=self.dtype)
+        ndim = self.ndim
+
+        shape = (len(mask), 1) if ndim == 1 else mask.shape
+        out = self._allocate_output(windows, shape)
+
         with self.ctx:
-            # TODO: Consider pre-filtering columns that are all-nan at each
-            # time-step?
             for idx, date in enumerate(dates):
-                compute(
-                    date,
-                    assets,
-                    out[idx],
-                    *(next(w) for w in windows),
-                    **params
-                )
-        out[~mask] = missing_value
+                # Never apply a mask to 1D outputs.
+                out_mask = array([True]) if ndim == 1 else mask[idx]
+
+                # Mask our inputs as usual.
+                inputs_mask = mask[idx]
+
+                masked_assets = assets[inputs_mask]
+                out_row = out[idx][out_mask]
+                inputs = format_inputs(windows, inputs_mask)
+
+                compute(date, masked_assets, out_row, *inputs, **params)
+                out[idx][out_mask] = out_row
         return out
 
     def short_repr(self):

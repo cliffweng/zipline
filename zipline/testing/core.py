@@ -1,38 +1,57 @@
+from abc import ABCMeta, abstractmethod, abstractproperty
 from contextlib import contextmanager
 from functools import wraps
+import gzip
 from inspect import getargspec
 from itertools import (
     combinations,
     count,
     product,
 )
-from nose.tools import nottest
 import operator
 import os
+from os.path import abspath, dirname, join, realpath
 import shutil
-from string import ascii_uppercase
+from sys import _getframe
 import tempfile
 
-from logbook import FileHandler, TestHandler
+from logbook import TestHandler
 from mock import patch
+from nose.tools import nottest
 from numpy.testing import assert_allclose, assert_array_equal
-import numpy as np
 import pandas as pd
-from pandas.tseries.offsets import MonthBegin
-from six import iteritems, itervalues
+from six import itervalues, iteritems, with_metaclass
 from six.moves import filter, map
 from sqlalchemy import create_engine
-from toolz import concat
+from testfixtures import TempDirectory
+from toolz import concat, curry
 
-from zipline.assets import AssetFinder
-from zipline.assets.asset_writer import AssetDBWriterFromDataFrame
-from zipline.assets.futures import CME_CODE_TO_MONTH
+from zipline.assets import AssetFinder, AssetDBWriter
+from zipline.assets.synthetic import make_simple_equity_info
+from zipline.data.data_portal import DataPortal
+from zipline.data.minute_bars import (
+    BcolzMinuteBarReader,
+    BcolzMinuteBarWriter,
+    US_EQUITIES_MINUTES_PER_DAY
+)
+from zipline.data.us_equity_pricing import (
+    BcolzDailyBarReader,
+    BcolzDailyBarWriter,
+    SQLiteAdjustmentWriter,
+)
+from zipline.finance.trading import TradingEnvironment
 from zipline.finance.order import ORDER_STATUS
+from zipline.lib.labelarray import LabelArray
+from zipline.pipeline.data import USEquityPricing
 from zipline.pipeline.engine import SimplePipelineEngine
+from zipline.pipeline.factors import CustomFactor
 from zipline.pipeline.loaders.testing import make_seeded_random_loader
 from zipline.utils import security_list
 from zipline.utils.input_validation import expect_dimensions
-from zipline.utils.tradingcalendar import trading_days
+from zipline.utils.sentinel import sentinel
+from zipline.utils.calendars import get_calendar
+import numpy as np
+from numpy import float64
 
 
 EPOCH = pd.Timestamp(0, tz='UTC')
@@ -60,16 +79,6 @@ def str_to_seconds(s):
     return int((pd.Timestamp(s, tz='UTC') - EPOCH).total_seconds())
 
 
-def setup_logger(test, path='test.log'):
-    test.log_handler = FileHandler(path)
-    test.log_handler.push_application()
-
-
-def teardown_logger(test):
-    test.log_handler.pop_application()
-    test.log_handler.close()
-
-
 def drain_zipline(test, zipline):
     output = []
     transaction_count = 0
@@ -83,6 +92,33 @@ def drain_zipline(test, zipline):
                 len(update['daily_perf']['transactions'])
 
     return output, transaction_count
+
+
+def check_algo_results(test,
+                       results,
+                       expected_transactions_count=None,
+                       expected_order_count=None,
+                       expected_positions_count=None,
+                       sid=None):
+
+    if expected_transactions_count is not None:
+        txns = flatten_list(results["transactions"])
+        test.assertEqual(expected_transactions_count, len(txns))
+
+    if expected_positions_count is not None:
+        raise NotImplementedError
+
+    if expected_order_count is not None:
+        # de-dup orders on id, because orders are put back into perf packets
+        # whenever they a txn is filled
+        orders = set([order['id'] for order in
+                      flatten_list(results["orders"])])
+
+        test.assertEqual(expected_order_count, len(orders))
+
+
+def flatten_list(list):
+    return [item for sublist in list for item in sublist]
 
 
 def assert_single_position(test, zipline):
@@ -135,24 +171,6 @@ def assert_single_position(test, zipline):
     )
 
     return output, transaction_count
-
-
-class ExceptionSource(object):
-
-    def __init__(self):
-        pass
-
-    def get_hash(self):
-        return "ExceptionSource"
-
-    def __iter__(self):
-        return self
-
-    def next(self):
-        5 / 0
-
-    def __next__(self):
-        5 / 0
 
 
 @contextmanager
@@ -269,153 +287,27 @@ def chrange(start, stop):
     return list(map(chr, range(ord(start), ord(stop) + 1)))
 
 
-def make_rotating_equity_info(num_assets,
-                              first_start,
-                              frequency,
-                              periods_between_starts,
-                              asset_lifetime):
+def make_trade_data_for_asset_info(dates,
+                                   asset_info,
+                                   price_start,
+                                   price_step_by_date,
+                                   price_step_by_sid,
+                                   volume_start,
+                                   volume_step_by_date,
+                                   volume_step_by_sid,
+                                   frequency,
+                                   writer=None):
     """
-    Create a DataFrame representing lifetimes of assets that are constantly
-    rotating in and out of existence.
-
-    Parameters
-    ----------
-    num_assets : int
-        How many assets to create.
-    first_start : pd.Timestamp
-        The start date for the first asset.
-    frequency : str or pd.tseries.offsets.Offset (e.g. trading_day)
-        Frequency used to interpret next two arguments.
-    periods_between_starts : int
-        Create a new asset every `frequency` * `periods_between_new`
-    asset_lifetime : int
-        Each asset exists for `frequency` * `asset_lifetime` days.
-
-    Returns
-    -------
-    info : pd.DataFrame
-        DataFrame representing newly-created assets.
+    Convert the asset info dataframe into a dataframe of trade data for each
+    sid, and write to the writer if provided. Write NaNs for locations where
+    assets did not exist. Return a dict of the dataframes, keyed by sid.
     """
-    return pd.DataFrame(
-        {
-            'symbol': [chr(ord('A') + i) for i in range(num_assets)],
-            # Start a new asset every `periods_between_starts` days.
-            'start_date': pd.date_range(
-                first_start,
-                freq=(periods_between_starts * frequency),
-                periods=num_assets,
-            ),
-            # Each asset lasts for `asset_lifetime` days.
-            'end_date': pd.date_range(
-                first_start + (asset_lifetime * frequency),
-                freq=(periods_between_starts * frequency),
-                periods=num_assets,
-            ),
-            'exchange': 'TEST',
-        },
-        index=range(num_assets),
-    )
+    trade_data = {}
+    sids = asset_info.index
 
-
-def make_simple_equity_info(sids, start_date, end_date, symbols=None):
-    """
-    Create a DataFrame representing assets that exist for the full duration
-    between `start_date` and `end_date`.
-
-    Parameters
-    ----------
-    sids : array-like of int
-    start_date : pd.Timestamp
-    end_date : pd.Timestamp
-    symbols : list, optional
-        Symbols to use for the assets.
-        If not provided, symbols are generated from the sequence 'A', 'B', ...
-
-    Returns
-    -------
-    info : pd.DataFrame
-        DataFrame representing newly-created assets.
-    """
-    num_assets = len(sids)
-    if symbols is None:
-        symbols = list(ascii_uppercase[:num_assets])
-    return pd.DataFrame(
-        {
-            'symbol': symbols,
-            'start_date': [start_date] * num_assets,
-            'end_date': [end_date] * num_assets,
-            'exchange': 'TEST',
-        },
-        index=sids,
-    )
-
-
-def make_jagged_equity_info(num_assets,
-                            start_date,
-                            first_end,
-                            frequency,
-                            periods_between_ends,
-                            auto_close_delta):
-    """
-    Create a DataFrame representing assets that all begin at the same start
-    date, but have cascading end dates.
-
-    Parameters
-    ----------
-    num_assets : int
-        How many assets to create.
-    start_date : pd.Timestamp
-        The start date for all the assets.
-    first_end : pd.Timestamp
-        The date at which the first equity will end.
-    frequency : str or pd.tseries.offsets.Offset (e.g. trading_day)
-        Frequency used to interpret the next argument.
-    periods_between_ends : int
-        Starting after the first end date, end each asset every
-        `frequency` * `periods_between_ends`.
-
-    Returns
-    -------
-    info : pd.DataFrame
-        DataFrame representing newly-created assets.
-    """
-    frame = pd.DataFrame(
-        {
-            'symbol': [chr(ord('A') + i) for i in range(num_assets)],
-            'start_date': start_date,
-            'end_date': pd.date_range(
-                first_end,
-                freq=(periods_between_ends * frequency),
-                periods=num_assets,
-            ),
-            'exchange': 'TEST',
-        },
-        index=range(num_assets),
-    )
-
-    # Explicitly pass None to disable setting the auto_close_date column.
-    if auto_close_delta is not None:
-        frame['auto_close_date'] = frame['end_date'] + auto_close_delta
-
-    return frame
-
-
-def make_trade_panel_for_asset_info(dates,
-                                    asset_info,
-                                    price_start,
-                                    price_step_by_date,
-                                    price_step_by_sid,
-                                    volume_start,
-                                    volume_step_by_date,
-                                    volume_step_by_sid):
-    """
-
-    locations where assets did not exist.
-    """
-    sids = list(asset_info.index)
-
-    price_sid_deltas = np.arange(len(sids), dtype=float) * price_step_by_sid
-    price_date_deltas = np.arange(len(dates), dtype=float) * price_step_by_date
+    price_sid_deltas = np.arange(len(sids), dtype=float64) * price_step_by_sid
+    price_date_deltas = (np.arange(len(dates), dtype=float64) *
+                         price_step_by_date)
     prices = (price_sid_deltas + price_date_deltas[:, None]) + price_start
 
     volume_sid_deltas = np.arange(len(sids)) * volume_step_by_sid
@@ -428,129 +320,26 @@ def make_trade_panel_for_asset_info(dates,
         # for an asset's last trading day.
         for i, date in enumerate(dates.normalize()):
             if not (start_date <= date <= end_date):
-                prices[i, j] = np.nan
+                prices[i, j] = 0
                 volumes[i, j] = 0
 
-    # Legacy panel sources use a flipped convention from what we return
-    # elsewhere.
-    return pd.Panel(
-        {
-            'price': prices,
-            'volume': volumes,
-        },
-        major_axis=dates,
-        minor_axis=sids,
-    ).transpose(2, 1, 0)
-
-
-def make_future_info(first_sid,
-                     root_symbols,
-                     years,
-                     notice_date_func,
-                     expiration_date_func,
-                     start_date_func,
-                     month_codes=None):
-    """
-    Create a DataFrame representing futures for `root_symbols` during `year`.
-
-    Generates a contract per triple of (symbol, year, month) supplied to
-    `root_symbols`, `years`, and `month_codes`.
-
-    Parameters
-    ----------
-    first_sid : int
-        The first sid to use for assigning sids to the created contracts.
-    root_symbols : list[str]
-        A list of root symbols for which to create futures.
-    years : list[int or str]
-        Years (e.g. 2014), for which to produce individual contracts.
-    notice_date_func : (Timestamp) -> Timestamp
-        Function to generate notice dates from first of the month associated
-        with asset month code.  Return NaT to simulate futures with no notice
-        date.
-    expiration_date_func : (Timestamp) -> Timestamp
-        Function to generate expiration dates from first of the month
-        associated with asset month code.
-    start_date_func : (Timestamp) -> Timestamp, optional
-        Function to generate start dates from first of the month associated
-        with each asset month code.  Defaults to a start_date one year prior
-        to the month_code date.
-    month_codes : dict[str -> [1..12]], optional
-        Dictionary of month codes for which to create contracts.  Entries
-        should be strings mapped to values from 1 (January) to 12 (December).
-        Default is zipline.futures.CME_CODE_TO_MONTH
-
-    Returns
-    -------
-    futures_info : pd.DataFrame
-        DataFrame of futures data suitable for passing to an
-        AssetDBWriterFromDataFrame.
-    """
-    if month_codes is None:
-        month_codes = CME_CODE_TO_MONTH
-
-    year_strs = list(map(str, years))
-    years = [pd.Timestamp(s, tz='UTC') for s in year_strs]
-
-    # Pairs of string/date like ('K06', 2006-05-01)
-    contract_suffix_to_beginning_of_month = tuple(
-        (month_code + year_str[-2:], year + MonthBegin(month_num))
-        for ((year, year_str), (month_code, month_num))
-        in product(
-            zip(years, year_strs),
-            iteritems(month_codes),
+        df = pd.DataFrame(
+            {
+                "open": prices[:, j],
+                "high": prices[:, j],
+                "low": prices[:, j],
+                "close": prices[:, j],
+                "volume": volumes[:, j],
+            },
+            index=dates,
         )
-    )
 
-    contracts = []
-    parts = product(root_symbols, contract_suffix_to_beginning_of_month)
-    for sid, (root_sym, (suffix, month_begin)) in enumerate(parts, first_sid):
-        contracts.append({
-            'sid': sid,
-            'root_symbol': root_sym,
-            'symbol': root_sym + suffix,
-            'start_date': start_date_func(month_begin),
-            'notice_date': notice_date_func(month_begin),
-            'expiration_date': notice_date_func(month_begin),
-            'multiplier': 500,
-        })
-    return pd.DataFrame.from_records(contracts, index='sid').convert_objects()
+        if writer:
+            writer.write_sid(sid, df)
 
+        trade_data[sid] = df
 
-def make_commodity_future_info(first_sid,
-                               root_symbols,
-                               years,
-                               month_codes=None):
-    """
-    Make futures testing data that simulates the notice/expiration date
-    behavior of physical commodities like oil.
-
-    Parameters
-    ----------
-    first_sid : int
-    root_symbols : list[str]
-    years : list[int]
-    month_codes : dict[str -> int]
-
-    Expiration dates are on the 20th of the month prior to the month code.
-    Notice dates are are on the 20th two months prior to the month code.
-    Start dates are one year before the contract month.
-
-    See Also
-    --------
-    make_future_info
-    """
-    nineteen_days = pd.Timedelta(days=19)
-    one_year = pd.Timedelta(days=365)
-    return make_future_info(
-        first_sid=first_sid,
-        root_symbols=root_symbols,
-        years=years,
-        notice_date_func=lambda dt: dt - MonthBegin(2) + nineteen_days,
-        expiration_date_func=lambda dt: dt - MonthBegin(1) + nineteen_days,
-        start_date_func=lambda dt: dt - one_year,
-        month_codes=month_codes,
-    )
+    return trade_data
 
 
 def check_allclose(actual,
@@ -591,7 +380,19 @@ def check_arrays(x, y, err_msg='', verbose=True, check_dtypes=True):
     assert type(x) == type(y), "{x} != {y}".format(x=type(x), y=type(y))
     assert x.dtype == y.dtype, "{x.dtype} != {y.dtype}".format(x=x, y=y)
 
-    return assert_array_equal(x, y, err_msg=err_msg, verbose=True)
+    if isinstance(x, LabelArray):
+        # Check that both arrays have missing values in the same locations...
+        assert_array_equal(
+            x.is_missing(),
+            y.is_missing(),
+            err_msg=err_msg,
+            verbose=verbose,
+        )
+        # ...then check the actual values as well.
+        x = x.as_string_array()
+        y = y.as_string_array()
+
+    return assert_array_equal(x, y, err_msg=err_msg, verbose=verbose)
 
 
 class UnexpectedAttributeAccess(Exception):
@@ -609,36 +410,396 @@ class ExplodingObject(object):
         raise UnexpectedAttributeAccess(name)
 
 
+def write_minute_data(trading_calendar, tempdir, minutes, sids):
+    first_session = trading_calendar.minute_to_session_label(
+        minutes[0], direction="none"
+    )
+    last_session = trading_calendar.minute_to_session_label(
+        minutes[-1], direction="none"
+    )
+
+    sessions = trading_calendar.sessions_in_range(first_session, last_session)
+
+    write_bcolz_minute_data(
+        trading_calendar,
+        sessions,
+        tempdir.path,
+        create_minute_bar_data(minutes, sids),
+    )
+    return tempdir.path
+
+
+def create_minute_bar_data(minutes, sids):
+    length = len(minutes)
+    for sid_idx, sid in enumerate(sids):
+        yield sid, pd.DataFrame(
+            {
+                'open': np.arange(length) + 10 + sid_idx,
+                'high': np.arange(length) + 15 + sid_idx,
+                'low': np.arange(length) + 8 + sid_idx,
+                'close': np.arange(length) + 10 + sid_idx,
+                'volume': 100 + sid_idx,
+            },
+            index=minutes,
+        )
+
+
+def create_daily_bar_data(sessions, sids):
+    length = len(sessions)
+    for sid_idx, sid in enumerate(sids):
+        yield sid, pd.DataFrame(
+            {
+                "open": (np.array(range(10, 10 + length)) + sid_idx),
+                "high": (np.array(range(15, 15 + length)) + sid_idx),
+                "low": (np.array(range(8, 8 + length)) + sid_idx),
+                "close": (np.array(range(10, 10 + length)) + sid_idx),
+                "volume": np.array(range(100, 100 + length)) + sid_idx,
+                "day": [session.value for session in sessions]
+            },
+            index=sessions,
+        )
+
+
+def write_daily_data(tempdir, sim_params, sids, trading_calendar):
+    path = os.path.join(tempdir.path, "testdaily.bcolz")
+    BcolzDailyBarWriter(path, trading_calendar,
+                        sim_params.start_session,
+                        sim_params.end_session).write(
+        create_daily_bar_data(sim_params.sessions, sids),
+    )
+
+    return path
+
+
+def create_data_portal(asset_finder, tempdir, sim_params, sids,
+                       trading_calendar, adjustment_reader=None):
+    if sim_params.data_frequency == "daily":
+        daily_path = write_daily_data(tempdir, sim_params, sids,
+                                      trading_calendar)
+
+        equity_daily_reader = BcolzDailyBarReader(daily_path)
+
+        return DataPortal(
+            asset_finder, trading_calendar,
+            first_trading_day=equity_daily_reader.first_trading_day,
+            equity_daily_reader=equity_daily_reader,
+            adjustment_reader=adjustment_reader
+        )
+    else:
+        minutes = trading_calendar.minutes_in_range(
+            sim_params.first_open,
+            sim_params.last_close
+        )
+
+        minute_path = write_minute_data(trading_calendar, tempdir, minutes,
+                                        sids)
+
+        equity_minute_reader = BcolzMinuteBarReader(minute_path)
+
+        return DataPortal(
+            asset_finder, trading_calendar,
+            first_trading_day=equity_minute_reader.first_trading_day,
+            equity_minute_reader=equity_minute_reader,
+            adjustment_reader=adjustment_reader
+        )
+
+
+def write_bcolz_minute_data(trading_calendar, days, path, data):
+    market_opens = trading_calendar.schedule.loc[days].market_open
+    market_closes = trading_calendar.schedule.loc[days].market_close
+
+    BcolzMinuteBarWriter(
+        days[0],
+        path,
+        market_opens,
+        market_closes,
+        US_EQUITIES_MINUTES_PER_DAY
+    ).write(data)
+
+
+def create_minute_df_for_asset(trading_calendar,
+                               start_dt,
+                               end_dt,
+                               interval=1,
+                               start_val=1,
+                               minute_blacklist=None):
+
+    asset_minutes = trading_calendar.minutes_for_sessions_in_range(
+        start_dt, end_dt
+    )
+    minutes_count = len(asset_minutes)
+    minutes_arr = np.array(range(start_val, start_val + minutes_count))
+
+    df = pd.DataFrame(
+        {
+            "open": minutes_arr + 1,
+            "high": minutes_arr + 2,
+            "low": minutes_arr - 1,
+            "close": minutes_arr,
+            "volume": 100 * minutes_arr,
+        },
+        index=asset_minutes,
+    )
+
+    if interval > 1:
+        counter = 0
+        while counter < len(minutes_arr):
+            df[counter:(counter + interval - 1)] = 0
+            counter += interval
+
+    if minute_blacklist is not None:
+        for minute in minute_blacklist:
+            df.loc[minute] = 0
+
+    return df
+
+
+def create_daily_df_for_asset(trading_calendar, start_day, end_day,
+                              interval=1):
+    days = trading_calendar.sessions_in_range(start_day, end_day)
+    days_count = len(days)
+    days_arr = np.arange(days_count) + 2
+
+    df = pd.DataFrame(
+        {
+            "open": days_arr + 1,
+            "high": days_arr + 2,
+            "low": days_arr - 1,
+            "close": days_arr,
+            "volume": days_arr * 100,
+        },
+        index=days,
+    )
+
+    if interval > 1:
+        # only keep every 'interval' rows
+        for idx, _ in enumerate(days_arr):
+            if (idx + 1) % interval != 0:
+                df["open"].iloc[idx] = 0
+                df["high"].iloc[idx] = 0
+                df["low"].iloc[idx] = 0
+                df["close"].iloc[idx] = 0
+                df["volume"].iloc[idx] = 0
+
+    return df
+
+
+def trades_by_sid_to_dfs(trades_by_sid, index):
+    for sidint, trades in iteritems(trades_by_sid):
+        opens = []
+        highs = []
+        lows = []
+        closes = []
+        volumes = []
+        for trade in trades:
+            opens.append(trade["open_price"])
+            highs.append(trade["high"])
+            lows.append(trade["low"])
+            closes.append(trade["close_price"])
+            volumes.append(trade["volume"])
+
+        yield sidint, pd.DataFrame(
+            {
+                "open": opens,
+                "high": highs,
+                "low": lows,
+                "close": closes,
+                "volume": volumes,
+            },
+            index=index,
+        )
+
+
+def create_data_portal_from_trade_history(asset_finder, trading_calendar,
+                                          tempdir, sim_params, trades_by_sid):
+    if sim_params.data_frequency == "daily":
+        path = os.path.join(tempdir.path, "testdaily.bcolz")
+        writer = BcolzDailyBarWriter(
+            path, trading_calendar,
+            sim_params.start_session,
+            sim_params.end_session
+        )
+        writer.write(
+            trades_by_sid_to_dfs(trades_by_sid, sim_params.sessions),
+        )
+
+        equity_daily_reader = BcolzDailyBarReader(path)
+
+        return DataPortal(
+            asset_finder, trading_calendar,
+            first_trading_day=equity_daily_reader.first_trading_day,
+            equity_daily_reader=equity_daily_reader,
+        )
+    else:
+        minutes = trading_calendar.minutes_in_range(
+            sim_params.first_open,
+            sim_params.last_close
+        )
+
+        length = len(minutes)
+        assets = {}
+
+        for sidint, trades in iteritems(trades_by_sid):
+            opens = np.zeros(length)
+            highs = np.zeros(length)
+            lows = np.zeros(length)
+            closes = np.zeros(length)
+            volumes = np.zeros(length)
+
+            for trade in trades:
+                # put them in the right place
+                idx = minutes.searchsorted(trade.dt)
+
+                opens[idx] = trade.open_price * 1000
+                highs[idx] = trade.high * 1000
+                lows[idx] = trade.low * 1000
+                closes[idx] = trade.close_price * 1000
+                volumes[idx] = trade.volume
+
+            assets[sidint] = pd.DataFrame({
+                "open": opens,
+                "high": highs,
+                "low": lows,
+                "close": closes,
+                "volume": volumes,
+                "dt": minutes
+            }).set_index("dt")
+
+        write_bcolz_minute_data(
+            trading_calendar,
+            sim_params.sessions,
+            tempdir.path,
+            assets
+        )
+
+        equity_minute_reader = BcolzMinuteBarReader(tempdir.path)
+
+        return DataPortal(
+            asset_finder, trading_calendar,
+            first_trading_day=equity_minute_reader.first_trading_day,
+            equity_minute_reader=equity_minute_reader,
+        )
+
+
+class FakeDataPortal(DataPortal):
+    def __init__(self, env=None, trading_calendar=None,
+                 first_trading_day=None):
+        if env is None:
+            env = TradingEnvironment()
+
+        if trading_calendar is None:
+            trading_calendar = get_calendar("NYSE")
+
+        super(FakeDataPortal, self).__init__(env.asset_finder,
+                                             trading_calendar,
+                                             first_trading_day)
+
+    def get_spot_value(self, asset, field, dt, data_frequency):
+        if field == "volume":
+            return 100
+        else:
+            return 1.0
+
+    def get_history_window(self, assets, end_dt, bar_count, frequency, field,
+                           ffill=True):
+        if frequency == "1d":
+            end_idx = \
+                self.trading_calendar.all_sessions.searchsorted(end_dt)
+            days = self.trading_calendar.all_sessions[
+                (end_idx - bar_count + 1):(end_idx + 1)
+            ]
+
+            df = pd.DataFrame(
+                np.full((bar_count, len(assets)), 100),
+                index=days,
+                columns=assets
+            )
+
+            return df
+
+
+class FetcherDataPortal(DataPortal):
+    """
+    Mock dataportal that returns fake data for history and non-fetcher
+    spot value.
+    """
+    def __init__(self, asset_finder, trading_calendar, first_trading_day=None):
+        super(FetcherDataPortal, self).__init__(asset_finder, trading_calendar,
+                                                first_trading_day)
+
+    def get_spot_value(self, asset, field, dt, data_frequency):
+        # if this is a fetcher field, exercise the regular code path
+        if self._is_extra_source(asset, field, self._augmented_sources_map):
+            return super(FetcherDataPortal, self).get_spot_value(
+                asset, field, dt, data_frequency)
+
+        # otherwise just return a fixed value
+        return int(asset)
+
+    def _get_daily_window_for_sid(self, asset, field, days_in_window,
+                                  extra_slot=True):
+        return np.arange(days_in_window, dtype=np.float64)
+
+    def _get_minute_window_for_asset(self, asset, field, minutes_for_window):
+        return np.arange(minutes_for_window, dtype=np.float64)
+
+
 class tmp_assets_db(object):
     """Create a temporary assets sqlite database.
     This is meant to be used as a context manager.
 
     Parameters
     ----------
-    data : pd.DataFrame, optional
-        The data to feed to the writer. By default this maps:
+    url : string
+        The URL for the database connection.
+    **frames
+        The frames to pass to the AssetDBWriter.
+        By default this maps equities:
         ('A', 'B', 'C') -> map(ord, 'ABC')
+
+    See Also
+    --------
+    empty_assets_db
+    tmp_asset_finder
     """
-    def __init__(self, **frames):
+    _default_equities = sentinel('_default_equities')
+
+    def __init__(self,
+                 url='sqlite:///:memory:',
+                 equities=_default_equities,
+                 **frames):
+        self._url = url
         self._eng = None
-        if not frames:
-            frames = {
-                'equities': make_simple_equity_info(
-                    list(map(ord, 'ABC')),
-                    pd.Timestamp(0),
-                    pd.Timestamp('2015'),
-                )
-            }
-        self._data = AssetDBWriterFromDataFrame(**frames)
+        if equities is self._default_equities:
+            equities = make_simple_equity_info(
+                list(map(ord, 'ABC')),
+                pd.Timestamp(0),
+                pd.Timestamp('2015'),
+            )
+
+        frames['equities'] = equities
+        self._frames = frames
+        self._eng = None  # set in enter and exit
 
     def __enter__(self):
-        self._eng = eng = create_engine('sqlite://')
-        self._data.write_all(eng)
+        self._eng = eng = create_engine(self._url)
+        AssetDBWriter(eng).write(**self._frames)
         return eng
 
     def __exit__(self, *excinfo):
         assert self._eng is not None, '_eng was not set in __enter__'
         self._eng.dispose()
+        self._eng = None
+
+
+def empty_assets_db():
+    """Context manager for creating an empty assets db.
+
+    See Also
+    --------
+    tmp_assets_db
+    """
+    return tmp_assets_db(equities=None)
 
 
 class tmp_asset_finder(tmp_assets_db):
@@ -646,15 +807,63 @@ class tmp_asset_finder(tmp_assets_db):
 
     Parameters
     ----------
-    data : dict, optional
-        The data to feed to the writer
+    url : string
+        The URL for the database connection.
+    finder_cls : type, optional
+        The type of asset finder to create from the assets db.
+    **frames
+        Forwarded to ``tmp_assets_db``.
+
+    See Also
+    --------
+    tmp_assets_db
     """
-    def __init__(self, finder_cls=AssetFinder, **frames):
+    def __init__(self,
+                 url='sqlite:///:memory:',
+                 finder_cls=AssetFinder,
+                 **frames):
         self._finder_cls = finder_cls
-        super(tmp_asset_finder, self).__init__(**frames)
+        super(tmp_asset_finder, self).__init__(url=url, **frames)
 
     def __enter__(self):
         return self._finder_cls(super(tmp_asset_finder, self).__enter__())
+
+
+def empty_asset_finder():
+    """Context manager for creating an empty asset finder.
+
+    See Also
+    --------
+    empty_assets_db
+    tmp_assets_db
+    tmp_asset_finder
+    """
+    return tmp_asset_finder(equities=None)
+
+
+class tmp_trading_env(tmp_asset_finder):
+    """Create a temporary trading environment.
+
+    Parameters
+    ----------
+    finder_cls : type, optional
+        The type of asset finder to create from the assets db.
+    **frames
+        Forwarded to ``tmp_assets_db``.
+
+    See Also
+    --------
+    empty_trading_env
+    tmp_asset_finder
+    """
+    def __enter__(self):
+        return TradingEnvironment(
+            asset_db_path=super(tmp_trading_env, self).__enter__().engine,
+        )
+
+
+def empty_trading_env():
+    return tmp_trading_env(equities=None)
 
 
 class SubTestFailures(AssertionError):
@@ -670,6 +879,7 @@ class SubTestFailures(AssertionError):
         )
 
 
+@nottest
 def subtest(iterator, *_names):
     """
     Construct a subtest in a unittest.
@@ -749,6 +959,39 @@ def subtest(iterator, *_names):
     return dec
 
 
+class MockDailyBarReader(object):
+    def spot_price(self, col, sid, dt):
+        return 100
+
+
+def create_mock_adjustment_data(splits=None, dividends=None, mergers=None):
+    if splits is None:
+        splits = create_empty_splits_mergers_frame()
+    elif not isinstance(splits, pd.DataFrame):
+        splits = pd.DataFrame(splits)
+
+    if mergers is None:
+        mergers = create_empty_splits_mergers_frame()
+    elif not isinstance(mergers, pd.DataFrame):
+        mergers = pd.DataFrame(mergers)
+
+    if dividends is None:
+        dividends = create_empty_dividends_frame()
+    elif not isinstance(dividends, pd.DataFrame):
+        dividends = pd.DataFrame(dividends)
+
+    return splits, mergers, dividends
+
+
+def create_mock_adjustments(tempdir, days, splits=None, dividends=None,
+                            mergers=None):
+    path = tempdir.getpath("test_adjustments.db")
+    SQLiteAdjustmentWriter(path, MockDailyBarReader(), days).write(
+        *create_mock_adjustment_data(splits, dividends, mergers)
+    )
+    return path
+
+
 def assert_timestamp_equal(left, right, compare_nat_equal=True, msg=""):
     """
     Assert that two pandas Timestamp objects are the same.
@@ -796,6 +1039,7 @@ def gen_calendars(start, stop, critical_dates):
         yield (all_dates.drop(to_drop),)
 
     # Also test with the trading calendar.
+    trading_days = get_calendar("NYSE").all_days
     yield (trading_days[trading_days.slice_indexer(start, stop)],)
 
 
@@ -830,7 +1074,7 @@ def temp_pipeline_engine(calendar, sids, random_seed, symbols=None):
         yield SimplePipelineEngine(get_loader, calendar, finder)
 
 
-def parameter_space(**params):
+def parameter_space(__fail_fast=False, **params):
     """
     Wrapper around subtest that allows passing keywords mapping names to
     iterables of values.
@@ -881,8 +1125,114 @@ def parameter_space(**params):
             )
 
         param_sets = product(*(params[name] for name in argnames))
-        return subtest(param_sets, *argnames)(f)
+
+        if __fail_fast:
+            @wraps(f)
+            def wrapped(self):
+                for args in param_sets:
+                    f(self, *args)
+            return wrapped
+        else:
+            return subtest(param_sets, *argnames)(f)
+
     return decorator
+
+
+def create_empty_dividends_frame():
+    return pd.DataFrame(
+        np.array(
+            [],
+            dtype=[
+                ('ex_date', 'datetime64[ns]'),
+                ('pay_date', 'datetime64[ns]'),
+                ('record_date', 'datetime64[ns]'),
+                ('declared_date', 'datetime64[ns]'),
+                ('amount', 'float64'),
+                ('sid', 'int32'),
+            ],
+        ),
+        index=pd.DatetimeIndex([], tz='UTC'),
+    )
+
+
+def create_empty_splits_mergers_frame():
+    return pd.DataFrame(
+        np.array(
+            [],
+            dtype=[
+                ('effective_date', 'int64'),
+                ('ratio', 'float64'),
+                ('sid', 'int64'),
+            ],
+        ),
+        index=pd.DatetimeIndex([]),
+    )
+
+
+def make_alternating_boolean_array(shape, first_value=True):
+    """
+    Create a 2D numpy array with the given shape containing alternating values
+    of False, True, False, True,... along each row and each column.
+
+    Examples
+    --------
+    >>> make_alternating_boolean_array((4,4))
+    array([[ True, False,  True, False],
+           [False,  True, False,  True],
+           [ True, False,  True, False],
+           [False,  True, False,  True]], dtype=bool)
+    >>> make_alternating_boolean_array((4,3), first_value=False)
+    array([[False,  True, False],
+           [ True, False,  True],
+           [False,  True, False],
+           [ True, False,  True]], dtype=bool)
+    """
+    if len(shape) != 2:
+        raise ValueError(
+            'Shape must be 2-dimensional. Given shape was {}'.format(shape)
+        )
+    alternating = np.empty(shape, dtype=np.bool)
+    for row in alternating:
+        row[::2] = first_value
+        row[1::2] = not(first_value)
+        first_value = not(first_value)
+    return alternating
+
+
+def make_cascading_boolean_array(shape, first_value=True):
+    """
+    Create a numpy array with the given shape containing cascading boolean
+    values, with `first_value` being the top-left value.
+
+    Examples
+    --------
+    >>> make_cascading_boolean_array((4,4))
+    array([[ True,  True,  True, False],
+           [ True,  True, False, False],
+           [ True, False, False, False],
+           [False, False, False, False]], dtype=bool)
+    >>> make_cascading_boolean_array((4,2))
+    array([[ True, False],
+           [False, False],
+           [False, False],
+           [False, False]], dtype=bool)
+    >>> make_cascading_boolean_array((2,4))
+    array([[ True,  True,  True, False],
+           [ True,  True, False, False]], dtype=bool)
+    """
+    if len(shape) != 2:
+        raise ValueError(
+            'Shape must be 2-dimensional. Given shape was {}'.format(shape)
+        )
+    cascading = np.full(shape, not(first_value), dtype=np.bool)
+    ending_col = shape[1] - 1
+    for row in cascading:
+        if ending_col > 0:
+            row[:ending_col] = first_value
+            ending_col -= 1
+        else:
+            break
+    return cascading
 
 
 @expect_dimensions(array=2)
@@ -922,3 +1272,250 @@ def make_test_handler(testcase, *args, **kwargs):
     handler = TestHandler(*args, **kwargs)
     testcase.addCleanup(handler.close)
     return handler
+
+
+def write_compressed(path, content):
+    """
+    Write a compressed (gzipped) file to `path`.
+    """
+    with gzip.open(path, 'wb') as f:
+        f.write(content)
+
+
+def read_compressed(path):
+    """
+    Write a compressed (gzipped) file from `path`.
+    """
+    with gzip.open(path, 'rb') as f:
+        return f.read()
+
+
+zipline_git_root = abspath(
+    join(realpath(dirname(__file__)), '..', '..'),
+)
+
+
+@nottest
+def test_resource_path(*path_parts):
+    return os.path.join(zipline_git_root, 'tests', 'resources', *path_parts)
+
+
+@contextmanager
+def patch_os_environment(remove=None, **values):
+    """
+    Context manager for patching the operating system environment.
+    """
+    old_values = {}
+    remove = remove or []
+    for key in remove:
+        old_values[key] = os.environ.pop(key)
+    for key, value in values.iteritems():
+        old_values[key] = os.getenv(key)
+        os.environ[key] = value
+    try:
+        yield
+    finally:
+        for old_key, old_value in old_values.iteritems():
+            if old_value is None:
+                # Value was not present when we entered, so del it out if it's
+                # still present.
+                try:
+                    del os.environ[key]
+                except KeyError:
+                    pass
+            else:
+                # Restore the old value.
+                os.environ[old_key] = old_value
+
+
+class tmp_dir(TempDirectory, object):
+    """New style class that wrapper for TempDirectory in python 2.
+    """
+    pass
+
+
+class _TmpBarReader(with_metaclass(ABCMeta, tmp_dir)):
+    """A helper for tmp_bcolz_equity_minute_bar_reader and
+    tmp_bcolz_equity_daily_bar_reader.
+
+    Parameters
+    ----------
+    env : TradingEnvironment
+        The trading env.
+    days : pd.DatetimeIndex
+        The days to write for.
+    data : dict[int -> pd.DataFrame]
+        The data to write.
+    path : str, optional
+        The path to the directory to write the data into. If not given, this
+        will be a unique name.
+    """
+    @abstractproperty
+    def _reader_cls(self):
+        raise NotImplementedError('_reader')
+
+    @abstractmethod
+    def _write(self, env, days, path, data):
+        raise NotImplementedError('_write')
+
+    def __init__(self, env, days, data, path=None):
+        super(_TmpBarReader, self).__init__(path=path)
+        self._env = env
+        self._days = days
+        self._data = data
+
+    def __enter__(self):
+        tmpdir = super(_TmpBarReader, self).__enter__()
+        env = self._env
+        try:
+            self._write(
+                env,
+                self._days,
+                tmpdir.path,
+                self._data,
+            )
+            return self._reader_cls(tmpdir.path)
+        except:
+            self.__exit__(None, None, None)
+            raise
+
+
+class tmp_bcolz_equity_minute_bar_reader(_TmpBarReader):
+    """A temporary BcolzMinuteBarReader object.
+
+    Parameters
+    ----------
+    env : TradingEnvironment
+        The trading env.
+    days : pd.DatetimeIndex
+        The days to write for.
+    data : iterable[(int, pd.DataFrame)]
+        The data to write.
+    path : str, optional
+        The path to the directory to write the data into. If not given, this
+        will be a unique name.
+
+    See Also
+    --------
+    tmp_bcolz_equity_daily_bar_reader
+    """
+    _reader_cls = BcolzMinuteBarReader
+    _write = staticmethod(write_bcolz_minute_data)
+
+
+class tmp_bcolz_equity_daily_bar_reader(_TmpBarReader):
+    """A temporary BcolzDailyBarReader object.
+
+    Parameters
+    ----------
+    env : TradingEnvironment
+        The trading env.
+    days : pd.DatetimeIndex
+        The days to write for.
+    data : dict[int -> pd.DataFrame]
+        The data to write.
+    path : str, optional
+        The path to the directory to write the data into. If not given, this
+        will be a unique name.
+
+    See Also
+    --------
+    tmp_bcolz_equity_daily_bar_reader
+    """
+    _reader_cls = BcolzDailyBarReader
+
+    @staticmethod
+    def _write(env, days, path, data):
+        BcolzDailyBarWriter(path, days).write(data)
+
+
+@contextmanager
+def patch_read_csv(url_map, module=pd, strict=False):
+    """Patch pandas.read_csv to map lookups from url to another.
+
+    Parameters
+    ----------
+    url_map : mapping[str or file-like object -> str or file-like object]
+        The mapping to use to redirect read_csv calls.
+    module : module, optional
+        The module to patch ``read_csv`` on. By default this is ``pandas``.
+        This should be set to another module if ``read_csv`` is early-bound
+        like ``from pandas import read_csv`` instead of late-bound like:
+        ``import pandas as pd; pd.read_csv``.
+    strict : bool, optional
+        If true, then this will assert that ``read_csv`` is only called with
+        elements in the ``url_map``.
+    """
+    read_csv = pd.read_csv
+
+    def patched_read_csv(filepath_or_buffer, *args, **kwargs):
+        if filepath_or_buffer in url_map:
+            return read_csv(url_map[filepath_or_buffer], *args, **kwargs)
+        elif not strict:
+            return read_csv(filepath_or_buffer, *args, **kwargs)
+        else:
+            raise AssertionError(
+                'attempted to call read_csv on  %r which not in the url map' %
+                filepath_or_buffer,
+            )
+
+    with patch.object(module, 'read_csv', patched_read_csv):
+        yield
+
+
+@curry
+def ensure_doctest(f, name=None):
+    """Ensure that an object gets doctested. This is useful for instances
+    of objects like curry or partial which are not discovered by default.
+
+    Parameters
+    ----------
+    f : any
+        The thing to doctest.
+    name : str, optional
+        The name to use in the doctest function mapping. If this is None,
+        Then ``f.__name__`` will be used.
+
+    Returns
+    -------
+    f : any
+       ``f`` unchanged.
+    """
+    _getframe(2).f_globals.setdefault('__test__', {})[
+        f.__name__ if name is None else name
+    ] = f
+    return f
+
+
+####################################
+# Shared factors for pipeline tests.
+####################################
+
+class AssetID(CustomFactor):
+    """
+    CustomFactor that returns the AssetID of each asset.
+
+    Useful for providing a Factor that produces a different value for each
+    asset.
+    """
+    window_length = 1
+    inputs = ()
+
+    def compute(self, today, assets, out):
+        out[:] = assets
+
+
+class AssetIDPlusDay(CustomFactor):
+    window_length = 1
+    inputs = ()
+
+    def compute(self, today, assets, out):
+        out[:] = assets + today.day
+
+
+class OpenPrice(CustomFactor):
+    window_length = 1
+    inputs = [USEquityPricing.open]
+
+    def compute(self, today, assets, out, open):
+        out[:] = open

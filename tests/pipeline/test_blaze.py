@@ -6,7 +6,6 @@ from __future__ import division
 from collections import OrderedDict
 from datetime import timedelta, time
 from itertools import product, chain
-from unittest import TestCase
 import warnings
 
 import blaze as bz
@@ -20,28 +19,29 @@ from pandas.util.testing import assert_frame_equal
 from toolz import keymap, valmap, concatv
 from toolz.curried import operator as op
 
+from zipline.assets.synthetic import make_simple_equity_info
+from zipline.errors import UnsupportedPipelineOutput
 from zipline.pipeline import Pipeline, CustomFactor
-from zipline.pipeline.data import DataSet, BoundColumn
+from zipline.pipeline.data import DataSet, BoundColumn, Column
 from zipline.pipeline.engine import SimplePipelineEngine
 from zipline.pipeline.loaders.blaze import (
     from_blaze,
     BlazeLoader,
-    NoDeltasWarning,
+    NoMetaDataWarning,
 )
 from zipline.pipeline.loaders.blaze.core import (
-    NonNumpyField,
+    ExprData,
     NonPipelineField,
-    no_deltas_rules,
-)
-from zipline.utils.numpy_utils import (
-    float64_dtype,
-    int64_dtype,
-    repeat_last_axis,
 )
 from zipline.testing import (
+    ZiplineTestCase,
+    parameter_space,
     tmp_asset_finder,
-    make_simple_equity_info,
 )
+from zipline.testing.fixtures import WithAssetFinder
+from zipline.testing.predicates import assert_equal, assert_isidentical
+from zipline.utils.numpy_utils import float64_dtype, int64_dtype
+
 
 nameof = op.attrgetter('name')
 dtypeof = op.attrgetter('dtype')
@@ -57,6 +57,7 @@ asset_infos = (
         pd.Timestamp('2015'),
     ),),
 )
+simple_asset_info = asset_infos[0][0]
 with_extra_sid = parameterized.expand(asset_infos)
 with_ignore_sid = parameterized.expand(
     product(chain.from_iterable(asset_infos), [True, False])
@@ -76,14 +77,17 @@ def _utc_localize_index_level_0(df):
     return df
 
 
-class BlazeToPipelineTestCase(TestCase):
+class BlazeToPipelineTestCase(WithAssetFinder, ZiplineTestCase):
+    START_DATE = pd.Timestamp(0)
+    END_DATE = pd.Timestamp('2015')
+
     @classmethod
-    def setUpClass(cls):
+    def init_class_fixtures(cls):
+        super(BlazeToPipelineTestCase, cls).init_class_fixtures()
         cls.dates = dates = pd.date_range('2014-01-01', '2014-01-03')
         dates = cls.dates.repeat(3)
-        cls.sids = sids = ord('A'), ord('B'), ord('C')
         cls.df = df = pd.DataFrame({
-            'sid': sids * 3,
+            'sid': cls.ASSET_FINDER_EQUITY_SIDS * 3,
             'value': (0., 1., 2., 1., 2., 3., 2., 3., 4.),
             'int_value': (0, 1, 2, 1, 2, 3, 2, 3, 4),
             'asof_date': dates,
@@ -106,13 +110,21 @@ class BlazeToPipelineTestCase(TestCase):
         cls.garbage_loader = BlazeLoader()
         cls.missing_values = {'int_value': 0}
 
+        cls.value_dshape = dshape("""var * {
+            sid: ?int64,
+            value: float64,
+            asof_date: datetime,
+            timestamp: datetime,
+        }""")
+
     def test_tabular(self):
         name = 'expr'
         expr = bz.data(self.df, name=name, dshape=self.dshape)
         ds = from_blaze(
             expr,
             loader=self.garbage_loader,
-            no_deltas_rule=no_deltas_rules.ignore,
+            no_deltas_rule='ignore',
+            no_checkpoints_rule='ignore',
             missing_values=self.missing_values,
         )
         self.assertEqual(ds.__name__, name)
@@ -124,20 +136,13 @@ class BlazeToPipelineTestCase(TestCase):
         self.assertTrue(np.isnan(ds.value.missing_value))
         self.assertEqual(ds.int_value.missing_value, 0)
 
-        invalid_type_fields = ('asof_date',)
-
-        for field in invalid_type_fields:
-            with self.assertRaises(AttributeError) as e:
-                getattr(ds, field)
-            self.assertIn("'%s'" % field, str(e.exception))
-            self.assertIn("'datetime'", str(e.exception))
-
         # test memoization
         self.assertIs(
             from_blaze(
                 expr,
                 loader=self.garbage_loader,
-                no_deltas_rule=no_deltas_rules.ignore,
+                no_deltas_rule='ignore',
+                no_checkpoints_rule='ignore',
                 missing_values=self.missing_values,
             ),
             ds,
@@ -149,7 +154,8 @@ class BlazeToPipelineTestCase(TestCase):
         value = from_blaze(
             expr.value,
             loader=self.garbage_loader,
-            no_deltas_rule=no_deltas_rules.ignore,
+            no_deltas_rule='ignore',
+            no_checkpoints_rule='ignore',
             missing_values=self.missing_values,
         )
         self.assertEqual(value.name, 'value')
@@ -161,7 +167,8 @@ class BlazeToPipelineTestCase(TestCase):
             from_blaze(
                 expr.value,
                 loader=self.garbage_loader,
-                no_deltas_rule=no_deltas_rules.ignore,
+                no_deltas_rule='ignore',
+                no_checkpoints_rule='ignore',
                 missing_values=self.missing_values,
             ),
             value,
@@ -170,7 +177,8 @@ class BlazeToPipelineTestCase(TestCase):
             from_blaze(
                 expr,
                 loader=self.garbage_loader,
-                no_deltas_rule=no_deltas_rules.ignore,
+                no_deltas_rule='ignore',
+                no_checkpoints_rule='ignore',
                 missing_values=self.missing_values,
             ).value,
             value,
@@ -181,7 +189,8 @@ class BlazeToPipelineTestCase(TestCase):
             from_blaze(
                 expr,
                 loader=self.garbage_loader,
-                no_deltas_rule=no_deltas_rules.ignore,
+                no_deltas_rule='ignore',
+                no_checkpoints_rule='ignore',
                 missing_values=self.missing_values,
             ),
             value.dataset,
@@ -192,9 +201,8 @@ class BlazeToPipelineTestCase(TestCase):
         expr = bz.data(
             self.df.loc[:, ['sid', 'value', 'timestamp']],
             name='expr',
-            dshape="""
-            var * {
-                sid: ?int64,
+            dshape="""var * {
+                sid: int64,
                 value: float64,
                 timestamp: datetime,
             }""",
@@ -204,32 +212,150 @@ class BlazeToPipelineTestCase(TestCase):
             from_blaze(
                 expr,
                 loader=self.garbage_loader,
-                no_deltas_rule=no_deltas_rules.ignore,
+                no_deltas_rule='ignore',
+                no_checkpoints_rule='ignore',
             )
         self.assertIn("'asof_date'", str(e.exception))
         self.assertIn(repr(str(expr.dshape.measure)), str(e.exception))
 
-    def test_auto_deltas(self):
+    def test_missing_timestamp(self):
         expr = bz.data(
-            {'ds': self.df,
-             'ds_deltas': pd.DataFrame(columns=self.df.columns)},
-            dshape=var * Record((
-                ('ds', self.dshape.measure),
-                ('ds_deltas', self.dshape.measure),
-            )),
+            self.df.loc[:, ['sid', 'value', 'asof_date']],
+            name='expr',
+            dshape="""var * {
+                sid: int64,
+                value: float64,
+                asof_date: datetime,
+            }""",
+        )
+
+        loader = BlazeLoader()
+
+        from_blaze(
+            expr,
+            loader=loader,
+            no_deltas_rule='ignore',
+            no_checkpoints_rule='ignore',
+        )
+
+        self.assertEqual(len(loader), 1)
+        exprdata, = loader.values()
+
+        assert_isidentical(
+            exprdata.expr,
+            bz.transform(expr, timestamp=expr.asof_date),
+        )
+
+    def test_from_blaze_no_resources_dataset_expr(self):
+        expr = bz.symbol('expr', self.dshape)
+
+        with self.assertRaises(ValueError) as e:
+            from_blaze(
+                expr,
+                loader=self.garbage_loader,
+                no_deltas_rule='ignore',
+                no_checkpoints_rule='ignore',
+                missing_values=self.missing_values,
+            )
+        assert_equal(
+            str(e.exception),
+            'no resources provided to compute expr',
+        )
+
+    @parameter_space(metadata={'deltas', 'checkpoints'})
+    def test_from_blaze_no_resources_metadata_expr(self, metadata):
+        expr = bz.data(self.df, name='expr', dshape=self.dshape)
+        metadata_expr = bz.symbol('metadata', self.dshape)
+
+        with self.assertRaises(ValueError) as e:
+            from_blaze(
+                expr,
+                loader=self.garbage_loader,
+                no_deltas_rule='ignore',
+                no_checkpoints_rule='ignore',
+                missing_values=self.missing_values,
+                **{metadata: metadata_expr}
+            )
+        assert_equal(
+            str(e.exception),
+            'no resources provided to compute %s' % metadata,
+        )
+
+    def test_from_blaze_mixed_resources_dataset_expr(self):
+        expr = bz.data(self.df, name='expr', dshape=self.dshape)
+
+        with self.assertRaises(ValueError) as e:
+            from_blaze(
+                expr,
+                resources={expr: self.df},
+                loader=self.garbage_loader,
+                no_deltas_rule='ignore',
+                no_checkpoints_rule='ignore',
+                missing_values=self.missing_values,
+            )
+        assert_equal(
+            str(e.exception),
+            'explicit and implicit resources provided to compute expr',
+        )
+
+    @parameter_space(metadata={'deltas', 'checkpoints'})
+    def test_from_blaze_mixed_resources_metadata_expr(self, metadata):
+        expr = bz.symbol('expr', self.dshape)
+        metadata_expr = bz.data(self.df, name=metadata, dshape=self.dshape)
+
+        with self.assertRaises(ValueError) as e:
+            from_blaze(
+                expr,
+                resources={metadata_expr: self.df},
+                loader=self.garbage_loader,
+                no_deltas_rule='ignore',
+                no_checkpoints_rule='ignore',
+                missing_values=self.missing_values,
+                **{metadata: metadata_expr}
+            )
+        assert_equal(
+            str(e.exception),
+            'explicit and implicit resources provided to compute %s' %
+            metadata,
+        )
+
+    @parameter_space(deltas={True, False}, checkpoints={True, False})
+    def test_auto_metadata(self, deltas, checkpoints):
+        select_level = op.getitem(('ignore', 'raise'))
+        m = {'ds': self.df}
+        if deltas:
+            m['ds_deltas'] = pd.DataFrame(columns=self.df.columns),
+        if checkpoints:
+            m['ds_checkpoints'] = pd.DataFrame(columns=self.df.columns),
+        expr = bz.data(
+            m,
+            dshape=var * Record((k, self.dshape.measure) for k in m),
         )
         loader = BlazeLoader()
         ds = from_blaze(
             expr.ds,
             loader=loader,
             missing_values=self.missing_values,
+            no_deltas_rule=select_level(deltas),
+            no_checkpoints_rule=select_level(checkpoints),
         )
         self.assertEqual(len(loader), 1)
         exprdata = loader[ds]
         self.assertTrue(exprdata.expr.isidentical(expr.ds))
-        self.assertTrue(exprdata.deltas.isidentical(expr.ds_deltas))
+        if deltas:
+            self.assertTrue(exprdata.deltas.isidentical(expr.ds_deltas))
+        else:
+            self.assertIsNone(exprdata.deltas)
+        if checkpoints:
+            self.assertTrue(
+                exprdata.checkpoints.isidentical(expr.ds_checkpoints),
+            )
+        else:
+            self.assertIsNone(exprdata.checkpoints)
 
-    def test_auto_deltas_fail_warn(self):
+    @parameter_space(deltas={True, False}, checkpoints={True, False})
+    def test_auto_metadata_fail_warn(self, deltas, checkpoints):
+        select_level = op.getitem(('ignore', 'warn'))
         with warnings.catch_warnings(record=True) as ws:
             warnings.simplefilter('always')
             loader = BlazeLoader()
@@ -237,53 +363,40 @@ class BlazeToPipelineTestCase(TestCase):
             from_blaze(
                 expr,
                 loader=loader,
-                no_deltas_rule=no_deltas_rules.warn,
+                no_deltas_rule=select_level(deltas),
+                no_checkpoints_rule=select_level(checkpoints),
                 missing_values=self.missing_values,
             )
-        self.assertEqual(len(ws), 1)
-        w = ws[0].message
-        self.assertIsInstance(w, NoDeltasWarning)
-        self.assertIn(str(expr), str(w))
+            self.assertEqual(len(ws), deltas + checkpoints)
 
-    def test_auto_deltas_fail_raise(self):
+        for w in ws:
+            w = w.message
+            self.assertIsInstance(w, NoMetaDataWarning)
+            self.assertIn(str(expr), str(w))
+
+    @parameter_space(deltas={True, False}, checkpoints={True, False})
+    def test_auto_metadata_fail_raise(self, deltas, checkpoints):
+        if not (deltas or checkpoints):
+            # not a real case
+            return
+        select_level = op.getitem(('ignore', 'raise'))
         loader = BlazeLoader()
         expr = bz.data(self.df, dshape=self.dshape)
         with self.assertRaises(ValueError) as e:
             from_blaze(
                 expr,
                 loader=loader,
-                no_deltas_rule=no_deltas_rules.raise_,
+                no_deltas_rule=select_level(deltas),
+                no_checkpoints_rule=select_level(checkpoints),
             )
         self.assertIn(str(expr), str(e.exception))
 
-    def test_non_numpy_field(self):
-        expr = bz.data(
-            [],
-            dshape="""
-            var * {
-                 a: datetime,
-                 asof_date: datetime,
-                 timestamp: datetime,
-            }""",
-        )
-        ds = from_blaze(
-            expr,
-            loader=self.garbage_loader,
-            no_deltas_rule=no_deltas_rules.ignore,
-        )
-        with self.assertRaises(AttributeError):
-            ds.a
-        self.assertIsInstance(object.__getattribute__(ds, 'a'), NonNumpyField)
-
     def test_non_pipeline_field(self):
-        # NOTE: This test will fail if we ever allow string types in
-        # the Pipeline API. If this happens, change the dtype of the `a` field
-        # of expr to another type we don't allow.
         expr = bz.data(
             [],
             dshape="""
             var * {
-                 a: string,
+                 a: complex,
                  asof_date: datetime,
                  timestamp: datetime,
             }""",
@@ -291,7 +404,8 @@ class BlazeToPipelineTestCase(TestCase):
         ds = from_blaze(
             expr,
             loader=self.garbage_loader,
-            no_deltas_rule=no_deltas_rules.ignore,
+            no_deltas_rule='ignore',
+            no_checkpoints_rule='ignore',
         )
         with self.assertRaises(AttributeError):
             ds.a
@@ -300,46 +414,341 @@ class BlazeToPipelineTestCase(TestCase):
             NonPipelineField,
         )
 
+    def test_cols_with_all_missing_vals(self):
+        """
+        Tests that when there is no known data, we get output where the
+        columns have the right dtypes and the right missing values filled in.
+
+        input (self.df):
+        Empty DataFrame
+        Columns: [sid, float_value, str_value, int_value, bool_value, dt_value,
+            asof_date, timestamp]
+        Index: []
+
+        output (expected)
+                                          str_value  float_value  int_value
+        2014-01-01 Equity(65 [A])      None          NaN          0
+                   Equity(66 [B])      None          NaN          0
+                   Equity(67 [C])      None          NaN          0
+        2014-01-02 Equity(65 [A])      None          NaN          0
+                   Equity(66 [B])      None          NaN          0
+                   Equity(67 [C])      None          NaN          0
+        2014-01-03 Equity(65 [A])      None          NaN          0
+                   Equity(66 [B])      None          NaN          0
+                   Equity(67 [C])      None          NaN          0
+
+                                  dt_value  bool_value
+        2014-01-01 Equity(65 [A])      NaT  False
+                   Equity(66 [B])      NaT  False
+                   Equity(67 [C])      NaT  False
+        2014-01-02 Equity(65 [A])      NaT  False
+                   Equity(66 [B])      NaT  False
+                   Equity(67 [C])      NaT  False
+        2014-01-03 Equity(65 [A])      NaT  False
+                   Equity(66 [B])      NaT  False
+                   Equity(67 [C])      NaT  False
+        """
+        df = pd.DataFrame(columns=['sid', 'float_value', 'str_value',
+                                   'int_value', 'bool_value', 'dt_value',
+                                   'asof_date', 'timestamp'])
+
+        expr = bz.data(
+            df,
+            dshape="""
+            var * {
+                 sid: int64,
+                 float_value: float64,
+                 str_value: string,
+                 int_value: int64,
+                 bool_value: bool,
+                 dt_value: datetime,
+                 asof_date: datetime,
+                 timestamp: datetime,
+            }""",
+        )
+        fields = OrderedDict(expr.dshape.measure.fields)
+
+        expected = pd.DataFrame({
+            "str_value": np.array([None,
+                                   None,
+                                   None,
+                                   None,
+                                   None,
+                                   None,
+                                   None,
+                                   None,
+                                   None],
+                                  dtype='object'),
+            "float_value": np.array([np.NaN,
+                                     np.NaN,
+                                     np.NaN,
+                                     np.NaN,
+                                     np.NaN,
+                                     np.NaN,
+                                     np.NaN,
+                                     np.NaN,
+                                     np.NaN],
+                                    dtype='float64'),
+            "int_value": np.array([0,
+                                   0,
+                                   0,
+                                   0,
+                                   0,
+                                   0,
+                                   0,
+                                   0,
+                                   0],
+                                  dtype='int64'),
+            "bool_value": np.array([False,
+                                    False,
+                                    False,
+                                    False,
+                                    False,
+                                    False,
+                                    False,
+                                    False,
+                                    False],
+                                   dtype='bool'),
+            "dt_value": [pd.NaT,
+                         pd.NaT,
+                         pd.NaT,
+                         pd.NaT,
+                         pd.NaT,
+                         pd.NaT,
+                         pd.NaT,
+                         pd.NaT,
+                         pd.NaT],
+        },
+            columns=['str_value', 'float_value', 'int_value', 'bool_value',
+                     'dt_value'],
+            index=pd.MultiIndex.from_product(
+                (self.dates, self.asset_finder.retrieve_all(
+                    self.ASSET_FINDER_EQUITY_SIDS
+                ))
+            )
+        )
+
+        self._test_id(
+            df,
+            var * Record(fields),
+            expected,
+            self.asset_finder,
+            ('float_value', 'str_value', 'int_value', 'bool_value',
+             'dt_value'),
+        )
+
+    def test_cols_with_some_missing_vals(self):
+        """
+        Tests the following:
+            1) Forward filling replaces missing values correctly for the data
+            types supported in pipeline.
+            2) We don't forward fill when the missing value is the actual value
+             we got for a date in the case of int/bool columns.
+            3) We get the correct type of missing value in the output.
+
+        input (self.df):
+           asof_date bool_value   dt_value  float_value  int_value  sid
+        0 2014-01-01       True 2011-01-01            0          1   65
+        1 2014-01-03       True 2011-01-02            1          2   66
+        2 2014-01-01       True 2011-01-03            2          3   67
+        3 2014-01-02      False        NaT          NaN          0   67
+
+          str_value  timestamp
+        0         a  2014-01-01
+        1         b  2014-01-03
+        2         c  2014-01-01
+        3      None  2014-01-02
+
+        output (expected)
+                                  str_value  float_value  int_value bool_value
+        2014-01-01 Equity(65 [A])         a            0          1       True
+                   Equity(66 [B])      None          NaN          0      False
+                   Equity(67 [C])         c            2          3       True
+        2014-01-02 Equity(65 [A])         a            0          1       True
+                   Equity(66 [B])      None          NaN          0      False
+                   Equity(67 [C])         c            2          0      False
+        2014-01-03 Equity(65 [A])         a            0          1       True
+                   Equity(66 [B])         b            1          2       True
+                   Equity(67 [C])         c            2          0      False
+
+                                    dt_value
+        2014-01-01 Equity(65 [A]) 2011-01-01
+                   Equity(66 [B])        NaT
+                   Equity(67 [C]) 2011-01-03
+        2014-01-02 Equity(65 [A]) 2011-01-01
+                   Equity(66 [B])        NaT
+                   Equity(67 [C]) 2011-01-03
+        2014-01-03 Equity(65 [A]) 2011-01-01
+                   Equity(66 [B]) 2011-01-02
+                   Equity(67 [C]) 2011-01-03
+        """
+        dates = (self.dates[0], self.dates[-1], self.dates[0], self.dates[1])
+        df = pd.DataFrame({
+            'sid': self.ASSET_FINDER_EQUITY_SIDS[:-1] +
+            (self.ASSET_FINDER_EQUITY_SIDS[-1],)*2,
+            'float_value': (0., 1., 2., np.NaN),
+            'str_value': ("a", "b", "c", None),
+            'int_value': (1, 2, 3, 0),
+            'bool_value': (True, True, True, False),
+            'dt_value': (pd.Timestamp('2011-01-01'),
+                         pd.Timestamp('2011-01-02'),
+                         pd.Timestamp('2011-01-03'),
+                         pd.NaT),
+            'asof_date': dates,
+            'timestamp': dates,
+        })
+
+        expr = bz.data(
+            df,
+            dshape="""
+            var * {
+                 sid: int64,
+                 float_value: float64,
+                 str_value: string,
+                 int_value: int64,
+                 bool_value: bool,
+                 dt_value: datetime,
+                 asof_date: datetime,
+                 timestamp: datetime,
+            }""",
+        )
+        fields = OrderedDict(expr.dshape.measure.fields)
+
+        expected = pd.DataFrame({
+            "str_value": np.array(["a",
+                                   None,
+                                   "c",
+                                   "a",
+                                   None,
+                                   "c",
+                                   "a",
+                                   "b",
+                                   "c"],
+                                  dtype='object'),
+            "float_value": np.array([0,
+                                     np.NaN,
+                                     2,
+                                     0,
+                                     np.NaN,
+                                     2,
+                                     0,
+                                     1,
+                                     2],
+                                    dtype='float64'),
+            "int_value": np.array([1,
+                                   0,
+                                   3,
+                                   1,
+                                   0,
+                                   0,
+                                   1,
+                                   2,
+                                   0],
+                                  dtype='int64'),
+            "bool_value": np.array([True,
+                                    False,
+                                    True,
+                                    True,
+                                    False,
+                                    False,
+                                    True,
+                                    True,
+                                    False],
+                                   dtype='bool'),
+            "dt_value": [pd.Timestamp('2011-01-01'),
+                         pd.NaT,
+                         pd.Timestamp('2011-01-03'),
+                         pd.Timestamp('2011-01-01'),
+                         pd.NaT,
+                         pd.Timestamp('2011-01-03'),
+                         pd.Timestamp('2011-01-01'),
+                         pd.Timestamp('2011-01-02'),
+                         pd.Timestamp('2011-01-03')],
+        },
+            columns=['str_value', 'float_value', 'int_value', 'bool_value',
+                     'dt_value'],
+            index=pd.MultiIndex.from_product(
+                (self.dates, self.asset_finder.retrieve_all(
+                    self.ASSET_FINDER_EQUITY_SIDS
+                ))
+            )
+        )
+
+        self._test_id(
+            df,
+            var * Record(fields),
+            expected,
+            self.asset_finder,
+            ('float_value', 'str_value', 'int_value', 'bool_value',
+             'dt_value'),
+        )
+
     def test_complex_expr(self):
-        expr = bz.data(self.df, dshape=self.dshape)
+        expr = bz.data(self.df, dshape=self.dshape, name='expr')
         # put an Add in the table
         expr_with_add = bz.transform(expr, value=expr.value + 1)
 
-        # Test that we can have complex expressions with no deltas
+        # test that we can have complex expressions with no metadata
         from_blaze(
             expr_with_add,
             deltas=None,
+            checkpoints=None,
             loader=self.garbage_loader,
             missing_values=self.missing_values,
+            no_checkpoints_rule='ignore',
         )
 
-        with self.assertRaises(TypeError):
+        with self.assertRaises(TypeError) as e:
+            # test that we cannot create a single column from a non field
             from_blaze(
                 expr.value + 1,  # put an Add in the column
                 deltas=None,
+                checkpoints=None,
                 loader=self.garbage_loader,
                 missing_values=self.missing_values,
+                no_checkpoints_rule='ignore',
             )
+        assert_equal(
+            str(e.exception),
+            "expression 'expr.value + 1' was array-like but not a simple field"
+            " of some larger table",
+        )
 
         deltas = bz.data(
             pd.DataFrame(columns=self.df.columns),
             dshape=self.dshape,
+            name='deltas',
         )
-        with self.assertRaises(TypeError):
-            from_blaze(
-                expr_with_add,
-                deltas=deltas,
-                loader=self.garbage_loader,
-                missing_values=self.missing_values,
-            )
+        checkpoints = bz.data(
+            pd.DataFrame(columns=self.df.columns),
+            dshape=self.dshape,
+            name='checkpoints',
+        )
 
-        with self.assertRaises(TypeError):
+        # test that we can have complex expressions with explicit metadata
+        from_blaze(
+            expr_with_add,
+            deltas=deltas,
+            checkpoints=checkpoints,
+            loader=self.garbage_loader,
+            missing_values=self.missing_values,
+        )
+
+        with self.assertRaises(TypeError) as e:
+            # test that we cannot create a single column from a non field
+            # even with explicit metadata
             from_blaze(
                 expr.value + 1,
                 deltas=deltas,
+                checkpoints=checkpoints,
                 loader=self.garbage_loader,
                 missing_values=self.missing_values,
             )
+        assert_equal(
+            str(e.exception),
+            "expression 'expr.value + 1' was array-like but not a simple field"
+            " of some larger table",
+        )
 
     def _test_id(self, df, dshape, expected, finder, add):
         expr = bz.data(df, name='expr', dshape=dshape)
@@ -347,7 +756,8 @@ class BlazeToPipelineTestCase(TestCase):
         ds = from_blaze(
             expr,
             loader=loader,
-            no_deltas_rule=no_deltas_rules.ignore,
+            no_deltas_rule='ignore',
+            no_checkpoints_rule='ignore',
             missing_values=self.missing_values,
         )
         p = Pipeline()
@@ -355,18 +765,54 @@ class BlazeToPipelineTestCase(TestCase):
             p.add(getattr(ds, a).latest, a)
         dates = self.dates
 
-        with tmp_asset_finder() as finder:
-            result = SimplePipelineEngine(
-                loader,
-                dates,
-                finder,
-            ).run_pipeline(p, dates[0], dates[-1])
-
+        result = SimplePipelineEngine(
+            loader,
+            dates,
+            finder,
+        ).run_pipeline(p, dates[0], dates[-1])
         assert_frame_equal(
-            result,
-            _utc_localize_index_level_0(expected),
+            result.sort_index(axis=1),
+            _utc_localize_index_level_0(expected.sort_index(axis=1)),
             check_dtype=False,
         )
+
+    def _test_id_macro(self, df, dshape, expected, finder, add):
+        dates = self.dates
+        expr = bz.data(df, name='expr', dshape=dshape)
+        loader = BlazeLoader()
+        ds = from_blaze(
+            expr,
+            loader=loader,
+            no_deltas_rule='ignore',
+            missing_values=self.missing_values,
+        )
+
+        p = Pipeline()
+        macro_inputs = []
+        for column_name in add:
+            column = getattr(ds, column_name)
+            macro_inputs.append(column)
+            with self.assertRaises(UnsupportedPipelineOutput):
+                # Single column output terms cannot be added to a pipeline.
+                p.add(column.latest, column_name)
+
+        class UsesMacroInputs(CustomFactor):
+            inputs = macro_inputs
+            window_length = 1
+
+            def compute(self, today, assets, out, *inputs):
+                e = expected.loc[today]
+                for i, input_ in enumerate(inputs):
+                    # Each macro input should only have one column.
+                    assert input_.shape == (self.window_length, 1)
+                    assert_equal(input_[0, 0], e[i])
+
+        # Run the pipeline with our custom factor. Assertions about the
+        # expected macro data are made in the `compute` function of our custom
+        # factor above.
+        p.add(UsesMacroInputs(), 'uses_macro_inputs')
+        engine = SimplePipelineEngine(loader, dates, finder)
+        engine.run_pipeline(p, dates[0], dates[-1])
 
     def test_custom_query_time_tz(self):
         df = self.df.copy()
@@ -380,7 +826,8 @@ class BlazeToPipelineTestCase(TestCase):
         ds = from_blaze(
             expr,
             loader=loader,
-            no_deltas_rule=no_deltas_rules.ignore,
+            no_deltas_rule='ignore',
+            no_checkpoints_rule='ignore',
             missing_values=self.missing_values,
         )
         p = Pipeline()
@@ -388,12 +835,11 @@ class BlazeToPipelineTestCase(TestCase):
         p.add(ds.int_value.latest, 'int_value')
         dates = self.dates
 
-        with tmp_asset_finder() as finder:
-            result = SimplePipelineEngine(
-                loader,
-                dates,
-                finder,
-            ).run_pipeline(p, dates[0], dates[-1])
+        result = SimplePipelineEngine(
+            loader,
+            dates,
+            self.asset_finder,
+        ).run_pipeline(p, dates[0], dates[-1])
 
         expected = df.drop('asof_date', axis=1)
         expected['timestamp'] = expected['timestamp'].dt.normalize().astype(
@@ -403,7 +849,7 @@ class BlazeToPipelineTestCase(TestCase):
         expected.set_index(['timestamp', 'sid'], inplace=True)
         expected.index = pd.MultiIndex.from_product((
             expected.index.levels[0],
-            finder.retrieve_all(expected.index.levels[1]),
+            self.asset_finder.retrieve_all(expected.index.levels[1]),
         ))
         assert_frame_equal(result, expected, check_dtype=False)
 
@@ -433,17 +879,17 @@ class BlazeToPipelineTestCase(TestCase):
                    Equity(66 [B])      3
                    Equity(67 [C])      4
         """
-        with tmp_asset_finder() as finder:
-            expected = self.df.drop('asof_date', axis=1).set_index(
-                ['timestamp', 'sid'],
-            )
-            expected.index = pd.MultiIndex.from_product((
-                expected.index.levels[0],
-                finder.retrieve_all(expected.index.levels[1]),
-            ))
-            self._test_id(
-                self.df, self.dshape, expected, finder, ('int_value', 'value',)
-            )
+        expected = self.df.drop('asof_date', axis=1).set_index(
+            ['timestamp', 'sid'],
+        )
+        expected.index = pd.MultiIndex.from_product((
+            expected.index.levels[0],
+            self.asset_finder.retrieve_all(expected.index.levels[1]),
+        ))
+        self._test_id(
+            self.df, self.dshape, expected, self.asset_finder,
+            ('int_value', 'value',)
+        )
 
     def test_id_ffill_out_of_window(self):
         """
@@ -474,7 +920,7 @@ class BlazeToPipelineTestCase(TestCase):
         """
         dates = self.dates.repeat(3) - timedelta(days=10)
         df = pd.DataFrame({
-            'sid': self.sids * 3,
+            'sid': self.ASSET_FINDER_EQUITY_SIDS * 3,
             'value': (0, 1, np.nan, 1, np.nan, 3, np.nan, 3, 4),
             'other': (0, np.nan, 2, np.nan, 2, 3, 2, 3, np.nan),
             'asof_date': dates,
@@ -483,29 +929,30 @@ class BlazeToPipelineTestCase(TestCase):
         fields = OrderedDict(self.dshape.measure.fields)
         fields['other'] = fields['value']
 
-        with tmp_asset_finder() as finder:
-            expected = pd.DataFrame(
-                np.array([[2, 1],
-                          [3, 3],
-                          [3, 4],
-                          [2, 1],
-                          [3, 3],
-                          [3, 4],
-                          [2, 1],
-                          [3, 3],
-                          [3, 4]]),
-                columns=['other', 'value'],
-                index=pd.MultiIndex.from_product(
-                    (self.dates, finder.retrieve_all(self.sids)),
-                ),
-            )
-            self._test_id(
-                df,
-                var * Record(fields),
-                expected,
-                finder,
-                ('value', 'other'),
-            )
+        expected = pd.DataFrame(
+            np.array([[2, 1],
+                      [3, 3],
+                      [3, 4],
+                      [2, 1],
+                      [3, 3],
+                      [3, 4],
+                      [2, 1],
+                      [3, 3],
+                      [3, 4]]),
+            columns=['other', 'value'],
+            index=pd.MultiIndex.from_product(
+                (self.dates, self.asset_finder.retrieve_all(
+                    self.ASSET_FINDER_EQUITY_SIDS
+                )),
+            ),
+        )
+        self._test_id(
+            df,
+            var * Record(fields),
+            expected,
+            self.asset_finder,
+            ('value', 'other'),
+        )
 
     def test_id_multiple_columns(self):
         """
@@ -537,21 +984,20 @@ class BlazeToPipelineTestCase(TestCase):
         df['other'] = df.value + 1
         fields = OrderedDict(self.dshape.measure.fields)
         fields['other'] = fields['value']
-        with tmp_asset_finder() as finder:
-            expected = df.drop('asof_date', axis=1).set_index(
-                ['timestamp', 'sid'],
-            ).sort_index(axis=1)
-            expected.index = pd.MultiIndex.from_product((
-                expected.index.levels[0],
-                finder.retrieve_all(expected.index.levels[1]),
-            ))
-            self._test_id(
-                df,
-                var * Record(fields),
-                expected,
-                finder,
-                ('value', 'int_value', 'other'),
-            )
+        expected = df.drop('asof_date', axis=1).set_index(
+            ['timestamp', 'sid'],
+        ).sort_index(axis=1)
+        expected.index = pd.MultiIndex.from_product((
+            expected.index.levels[0],
+            self.asset_finder.retrieve_all(expected.index.levels[1]),
+        ))
+        self._test_id(
+            df,
+            var * Record(fields),
+            expected,
+            self.asset_finder,
+            ('value', 'int_value', 'other'),
+        )
 
     def test_id_macro_dataset(self):
         """
@@ -562,35 +1008,25 @@ class BlazeToPipelineTestCase(TestCase):
         6 2014-01-03 2014-01-03      2
 
         output (expected):
-                                   value
-        2014-01-01 Equity(65 [A])      0
-                   Equity(66 [B])      0
-                   Equity(67 [C])      0
-        2014-01-02 Equity(65 [A])      1
-                   Equity(66 [B])      1
-                   Equity(67 [C])      1
-        2014-01-03 Equity(65 [A])      2
-                   Equity(66 [B])      2
-                   Equity(67 [C])      2
+                    value
+        2014-01-01      0
+        2014-01-02      1
+        2014-01-03      2
         """
-        asset_info = asset_infos[0][0]
-        nassets = len(asset_info)
-        with tmp_asset_finder() as finder:
-            expected = pd.DataFrame(
-                list(concatv([0] * nassets, [1] * nassets, [2] * nassets)),
-                index=pd.MultiIndex.from_product((
-                    self.macro_df.timestamp,
-                    finder.retrieve_all(asset_info.index),
-                )),
-                columns=('value',),
-            )
-            self._test_id(
-                self.macro_df,
-                self.macro_dshape,
-                expected,
-                finder,
-                ('value',),
-            )
+        expected = pd.DataFrame(
+            data=[[0],
+                  [1],
+                  [2]],
+            columns=['value'],
+            index=self.dates,
+        )
+        self._test_id_macro(
+            self.macro_df,
+            self.macro_dshape,
+            expected,
+            self.asset_finder,
+            ('value',),
+        )
 
     def test_id_ffill_out_of_window_macro_dataset(self):
         """
@@ -601,16 +1037,10 @@ class BlazeToPipelineTestCase(TestCase):
         2 2013-12-24 2013-12-24    NaN    NaN
 
         output (expected):
-                                   other  value
-        2014-01-01 Equity(65 [A])      1      0
-                   Equity(66 [B])      1      0
-                   Equity(67 [C])      1      0
-        2014-01-02 Equity(65 [A])      1      0
-                   Equity(66 [B])      1      0
-                   Equity(67 [C])      1      0
-        2014-01-03 Equity(65 [A])      1      0
-                   Equity(66 [B])      1      0
-                   Equity(67 [C])      1      0
+                    other  value
+        2014-01-01      1      0
+        2014-01-02      1      0
+        2014-01-03      1      0
         """
         dates = self.dates - timedelta(days=10)
         df = pd.DataFrame({
@@ -622,29 +1052,20 @@ class BlazeToPipelineTestCase(TestCase):
         fields = OrderedDict(self.macro_dshape.measure.fields)
         fields['other'] = fields['value']
 
-        with tmp_asset_finder() as finder:
-            expected = pd.DataFrame(
-                np.array([[0, 1],
-                          [0, 1],
-                          [0, 1],
-                          [0, 1],
-                          [0, 1],
-                          [0, 1],
-                          [0, 1],
-                          [0, 1],
-                          [0, 1]]),
-                columns=['value', 'other'],
-                index=pd.MultiIndex.from_product(
-                    (self.dates, finder.retrieve_all(self.sids)),
-                ),
-            ).sort_index(axis=1)
-            self._test_id(
-                df,
-                var * Record(fields),
-                expected,
-                finder,
-                ('value', 'other'),
-            )
+        expected = pd.DataFrame(
+            data=[[0, 1],
+                  [0, 1],
+                  [0, 1]],
+            columns=['other', 'value'],
+            index=self.dates,
+        )
+        self._test_id_macro(
+            df,
+            var * Record(fields),
+            expected,
+            self.asset_finder,
+            ('value', 'other'),
+        )
 
     def test_id_macro_dataset_multiple_columns(self):
         """
@@ -655,35 +1076,26 @@ class BlazeToPipelineTestCase(TestCase):
         6 2014-01-03 2014-01-03      3      2
 
         output (expected):
-                                   other  value
-        2014-01-01 Equity(65 [A])      1      0
-                   Equity(66 [B])      1      0
-                   Equity(67 [C])      1      0
-        2014-01-02 Equity(65 [A])      2      1
-                   Equity(66 [B])      2      1
-                   Equity(67 [C])      2      1
-        2014-01-03 Equity(65 [A])      3      2
-                   Equity(66 [B])      3      2
-                   Equity(67 [C])      3      2
+                    other  value
+        2014-01-01      1      0
+        2014-01-02      2      1
+        2014-01-03      3      2
         """
         df = self.macro_df.copy()
         df['other'] = df.value + 1
         fields = OrderedDict(self.macro_dshape.measure.fields)
         fields['other'] = fields['value']
 
-        asset_info = asset_infos[0][0]
-        with tmp_asset_finder(equities=asset_info) as finder:
+        with tmp_asset_finder(equities=simple_asset_info) as finder:
             expected = pd.DataFrame(
-                np.array([[0, 1],
-                          [1, 2],
-                          [2, 3]]).repeat(3, axis=0),
-                index=pd.MultiIndex.from_product((
-                    df.timestamp,
-                    finder.retrieve_all(asset_info.index),
-                )),
-                columns=('value', 'other'),
-            ).sort_index(axis=1)
-            self._test_id(
+                data=[[0, 1],
+                      [1, 2],
+                      [2, 3]],
+                columns=['value', 'other'],
+                index=self.dates,
+                dtype=np.float64,
+            )
+            self._test_id_macro(
                 df,
                 var * Record(fields),
                 expected,
@@ -719,46 +1131,41 @@ class BlazeToPipelineTestCase(TestCase):
         fields = OrderedDict(self.dshape.measure.fields)
         fields['other'] = fields['value']
 
-        with tmp_asset_finder() as finder:
-            expected = pd.DataFrame(
-                columns=['other', 'value'],
-                data=[
-                    [1,           0],  # 2014-01-01 Equity(65 [A])
-                    [np.nan,      1],             # Equity(66 [B])
-                    [2,      np.nan],             # Equity(67 [C])
-                    [1,           1],  # 2014-01-02 Equity(65 [A])
-                    [2,           1],             # Equity(66 [B])
-                    [3,           3],             # Equity(67 [C])
-                    [2,           1],  # 2014-01-03 Equity(65 [A])
-                    [3,           3],             # Equity(66 [B])
-                    [3,           3],             # Equity(67 [C])
-                ],
-                index=pd.MultiIndex.from_product(
-                    (self.dates, finder.retrieve_all(self.sids)),
-                ),
-            )
-            self._test_id(
-                df,
-                var * Record(fields),
-                expected,
-                finder,
-                ('value', 'other'),
-            )
+        expected = pd.DataFrame(
+            columns=['other', 'value'],
+            data=[
+                [1,           0],  # 2014-01-01 Equity(65 [A])
+                [np.nan,      1],             # Equity(66 [B])
+                [2,      np.nan],             # Equity(67 [C])
+                [1,           1],  # 2014-01-02 Equity(65 [A])
+                [2,           1],             # Equity(66 [B])
+                [3,           3],             # Equity(67 [C])
+                [2,           1],  # 2014-01-03 Equity(65 [A])
+                [3,           3],             # Equity(66 [B])
+                [3,           3],             # Equity(67 [C])
+            ],
+            index=pd.MultiIndex.from_product(
+                (self.dates, self.asset_finder.retrieve_all(
+                    self.ASSET_FINDER_EQUITY_SIDS
+                )),
+            ),
+        )
+        self._test_id(
+            df,
+            var * Record(fields),
+            expected,
+            self.asset_finder,
+            ('value', 'other'),
+        )
 
     def test_id_take_last_in_group_macro(self):
         """
         output (expected):
 
-                                   other  value
-        2014-01-01 Equity(65 [A])    NaN      1
-                   Equity(66 [B])    NaN      1
-                   Equity(67 [C])    NaN      1
-        2014-01-02 Equity(65 [A])      1      2
-                   Equity(66 [B])      1      2
-                   Equity(67 [C])      1      2
-        2014-01-03 Equity(65 [A])      2      2
-                   Equity(66 [B])      2      2
-                   Equity(67 [C])      2      2
+                    other  value
+        2014-01-01    NaN      1
+        2014-01-02      1      2
+        2014-01-03      2      2
          """
         T = pd.Timestamp
         df = pd.DataFrame(
@@ -775,37 +1182,25 @@ class BlazeToPipelineTestCase(TestCase):
         fields = OrderedDict(self.macro_dshape.measure.fields)
         fields['other'] = fields['value']
 
-        with tmp_asset_finder() as finder:
-            expected = pd.DataFrame(
-                columns=[
-                    'other', 'value',
-                ],
-                data=[
-                    [np.nan,      1],  # 2014-01-01 Equity(65 [A])
-                    [np.nan,      1],             # Equity(66 [B])
-                    [np.nan,      1],             # Equity(67 [C])
-                    [1,           2],  # 2014-01-02 Equity(65 [A])
-                    [1,           2],             # Equity(66 [B])
-                    [1,           2],             # Equity(67 [C])
-                    [2,           2],  # 2014-01-03 Equity(65 [A])
-                    [2,           2],             # Equity(66 [B])
-                    [2,           2],             # Equity(67 [C])
-                ],
-                index=pd.MultiIndex.from_product(
-                    (self.dates, finder.retrieve_all(self.sids)),
-                ),
-            )
-            self._test_id(
-                df,
-                var * Record(fields),
-                expected,
-                finder,
-                ('value', 'other'),
-            )
+        expected = pd.DataFrame(
+            data=[[np.nan, 1],   # 2014-01-01
+                  [1,      2],   # 2014-01-02
+                  [2,      2]],  # 2014-01-03
+            columns=['other', 'value'],
+            index=self.dates,
+        )
+        self._test_id_macro(
+            df,
+            var * Record(fields),
+            expected,
+            self.asset_finder,
+            ('other', 'value'),
+        )
 
     def _run_pipeline(self,
                       expr,
                       deltas,
+                      checkpoints,
                       expected_views,
                       expected_output,
                       finder,
@@ -818,8 +1213,10 @@ class BlazeToPipelineTestCase(TestCase):
         ds = from_blaze(
             expr,
             deltas,
+            checkpoints,
             loader=loader,
-            no_deltas_rule=no_deltas_rules.raise_,
+            no_deltas_rule='raise',
+            no_checkpoints_rule='ignore',
             missing_values=self.missing_values,
         )
         p = Pipeline()
@@ -832,7 +1229,11 @@ class BlazeToPipelineTestCase(TestCase):
             window_length = window_length_
 
             def compute(self, today, assets, out, data):
-                assert_array_almost_equal(data, expected_views[today])
+                assert_array_almost_equal(
+                    data,
+                    expected_views[today],
+                    err_msg=str(today),
+                )
                 out[:] = compute_fn(data)
 
         p.add(TestFactor(), 'value')
@@ -904,6 +1305,7 @@ class BlazeToPipelineTestCase(TestCase):
             self._run_pipeline(
                 expr,
                 deltas,
+                None,
                 expected_views,
                 expected_output,
                 finder,
@@ -956,6 +1358,7 @@ class BlazeToPipelineTestCase(TestCase):
             self._run_pipeline(
                 expr,
                 deltas,
+                None,
                 expected_views,
                 expected_output,
                 finder,
@@ -967,7 +1370,6 @@ class BlazeToPipelineTestCase(TestCase):
             )
 
     def test_deltas_macro(self):
-        asset_info = asset_infos[0][0]
         expr = bz.data(self.macro_df, name='expr', dshape=self.macro_dshape)
         deltas = bz.data(
             self.macro_df.iloc[:-1],
@@ -980,18 +1382,20 @@ class BlazeToPipelineTestCase(TestCase):
             timestamp=deltas.timestamp + timedelta(days=1),
         )
 
-        nassets = len(asset_info)
+        nassets = len(simple_asset_info)
         expected_views = keymap(pd.Timestamp, {
-            '2014-01-02': repeat_last_axis(np.array([10.0, 1.0]), nassets),
-            '2014-01-03': repeat_last_axis(np.array([11.0, 2.0]), nassets),
+            '2014-01-02': np.array([[10.0],
+                                    [1.0]]),
+            '2014-01-03': np.array([[11.0],
+                                    [2.0]]),
         })
 
-        with tmp_asset_finder(equities=asset_info) as finder:
+        with tmp_asset_finder(equities=simple_asset_info) as finder:
             expected_output = pd.DataFrame(
                 list(concatv([10] * nassets, [11] * nassets)),
                 index=pd.MultiIndex.from_product((
                     sorted(expected_views.keys()),
-                    finder.retrieve_all(asset_info.index),
+                    finder.retrieve_all(simple_asset_info.index),
                 )),
                 columns=('value',),
             )
@@ -999,6 +1403,7 @@ class BlazeToPipelineTestCase(TestCase):
             self._run_pipeline(
                 expr,
                 deltas,
+                None,
                 expected_views,
                 expected_output,
                 finder,
@@ -1017,7 +1422,7 @@ class BlazeToPipelineTestCase(TestCase):
         ])
         repeated_dates = base_dates.repeat(3)
         baseline = pd.DataFrame({
-            'sid': self.sids * 2,
+            'sid': self.ASSET_FINDER_EQUITY_SIDS * 2,
             'value': (0., 1., 2., 1., 2., 3.),
             'int_value': (0, 1, 2, 1, 2, 3),
             'asof_date': repeated_dates,
@@ -1073,6 +1478,7 @@ class BlazeToPipelineTestCase(TestCase):
             self._run_pipeline(
                 expr,
                 deltas,
+                None,
                 expected_views,
                 expected_output,
                 finder,
@@ -1084,7 +1490,6 @@ class BlazeToPipelineTestCase(TestCase):
             )
 
     def test_novel_deltas_macro(self):
-        asset_info = asset_infos[0][0]
         base_dates = pd.DatetimeIndex([
             pd.Timestamp('2014-01-01'),
             pd.Timestamp('2014-01-04')
@@ -1102,16 +1507,14 @@ class BlazeToPipelineTestCase(TestCase):
             timestamp=deltas.timestamp + timedelta(days=1),
         )
 
-        nassets = len(asset_info)
+        nassets = len(simple_asset_info)
         expected_views = keymap(pd.Timestamp, {
-            '2014-01-03': repeat_last_axis(
-                np.array([10.0, 10.0, 10.0]),
-                nassets,
-            ),
-            '2014-01-06': repeat_last_axis(
-                np.array([10.0, 10.0, 11.0]),
-                nassets,
-            ),
+            '2014-01-03': np.array([[10.0],
+                                    [10.0],
+                                    [10.0]]),
+            '2014-01-06': np.array([[10.0],
+                                    [10.0],
+                                    [11.0]]),
         })
 
         cal = pd.DatetimeIndex([
@@ -1121,18 +1524,19 @@ class BlazeToPipelineTestCase(TestCase):
             # omitting the 4th and 5th to simulate a weekend
             pd.Timestamp('2014-01-06'),
         ])
-        with tmp_asset_finder(equities=asset_info) as finder:
+        with tmp_asset_finder(equities=simple_asset_info) as finder:
             expected_output = pd.DataFrame(
                 list(concatv([10] * nassets, [11] * nassets)),
                 index=pd.MultiIndex.from_product((
                     sorted(expected_views.keys()),
-                    finder.retrieve_all(asset_info.index),
+                    finder.retrieve_all(simple_asset_info.index),
                 )),
                 columns=('value',),
             )
             self._run_pipeline(
                 expr,
                 deltas,
+                None,
                 expected_views,
                 expected_output,
                 finder,
@@ -1142,3 +1546,236 @@ class BlazeToPipelineTestCase(TestCase):
                 window_length=3,
                 compute_fn=op.itemgetter(-1),
             )
+
+    def _test_checkpoints_macro(self, checkpoints, ffilled_value=-1.0):
+        """Simple checkpoints test that accepts a checkpoints dataframe and
+        the expected value for 2014-01-03 for macro datasets.
+
+        The underlying data has value -1.0 on 2014-01-01 and 1.0 on 2014-01-04.
+
+        Parameters
+        ----------
+        checkpoints : pd.DataFrame
+            The checkpoints data.
+        ffilled_value : float, optional
+            The value to be read on the third, if not provided, it will be the
+            value in the base data that will be naturally ffilled there.
+        """
+        dates = pd.Timestamp('2014-01-01'), pd.Timestamp('2014-01-04')
+        baseline = pd.DataFrame({
+            'value': [-1.0, 1.0],
+            'asof_date': dates,
+            'timestamp': dates,
+        })
+
+        nassets = len(simple_asset_info)
+        expected_views = keymap(pd.Timestamp, {
+            '2014-01-03': np.array([[ffilled_value]]),
+            '2014-01-04': np.array([[1.0]]),
+        })
+
+        with tmp_asset_finder(equities=simple_asset_info) as finder:
+            expected_output = pd.DataFrame(
+                list(concatv([ffilled_value] * nassets, [1.0] * nassets)),
+                index=pd.MultiIndex.from_product((
+                    sorted(expected_views.keys()),
+                    finder.retrieve_all(simple_asset_info.index),
+                )),
+                columns=('value',),
+            )
+
+            self._run_pipeline(
+                bz.data(baseline, name='expr', dshape=self.macro_dshape),
+                None,
+                bz.data(
+                    checkpoints,
+                    name='expr_checkpoints',
+                    dshape=self.macro_dshape,
+                ),
+                expected_views,
+                expected_output,
+                finder,
+                calendar=pd.date_range('2014-01-01', '2014-01-04'),
+                start=pd.Timestamp('2014-01-03'),
+                end=dates[-1],
+                window_length=1,
+                compute_fn=op.itemgetter(-1),
+            )
+
+    def test_checkpoints_macro(self):
+        ffilled_value = 0.0
+
+        checkpoints_ts = pd.Timestamp('2014-01-02')
+        checkpoints = pd.DataFrame({
+            'value': [ffilled_value],
+            'asof_date': checkpoints_ts,
+            'timestamp': checkpoints_ts,
+        })
+
+        self._test_checkpoints_macro(checkpoints, ffilled_value)
+
+    def test_empty_checkpoints_macro(self):
+        empty_checkpoints = pd.DataFrame({
+            'value': [],
+            'asof_date': [],
+            'timestamp': [],
+        })
+
+        self._test_checkpoints_macro(empty_checkpoints)
+
+    def test_checkpoints_out_of_bounds_macro(self):
+        # provide two checkpoints, one before the data in the base table
+        # and one after, these should not affect the value on the third
+        dates = pd.to_datetime(['2013-12-31', '2014-01-05'])
+        checkpoints = pd.DataFrame({
+            'value': [-2, 2],
+            'asof_date': dates,
+            'timestamp': dates,
+        })
+
+        self._test_checkpoints_macro(checkpoints)
+
+    def _test_checkpoints(self, checkpoints, ffilled_values=None):
+        """Simple checkpoints test that accepts a checkpoints dataframe and
+        the expected value for 2014-01-03.
+
+        The underlying data has value -1.0 on 2014-01-01 and 1.0 on 2014-01-04.
+
+        Parameters
+        ----------
+        checkpoints : pd.DataFrame
+            The checkpoints data.
+        ffilled_value : float, optional
+            The value to be read on the third, if not provided, it will be the
+            value in the base data that will be naturally ffilled there.
+        """
+        nassets = len(simple_asset_info)
+
+        dates = pd.to_datetime(['2014-01-01', '2014-01-04'])
+        dates_repeated = np.tile(dates, nassets)
+        values = np.arange(nassets) + 1
+        values = np.hstack((values[::-1], values))
+        baseline = pd.DataFrame({
+            'sid': np.tile(simple_asset_info.index, 2),
+            'value': values,
+            'asof_date': dates_repeated,
+            'timestamp': dates_repeated,
+        })
+
+        if ffilled_values is None:
+            ffilled_values = baseline.value.iloc[:nassets]
+
+        updated_values = baseline.value.iloc[nassets:]
+
+        expected_views = keymap(pd.Timestamp, {
+            '2014-01-03': [ffilled_values],
+            '2014-01-04': [updated_values],
+        })
+
+        with tmp_asset_finder(equities=simple_asset_info) as finder:
+            expected_output = pd.DataFrame(
+                list(concatv(ffilled_values, updated_values)),
+                index=pd.MultiIndex.from_product((
+                    sorted(expected_views.keys()),
+                    finder.retrieve_all(simple_asset_info.index),
+                )),
+                columns=('value',),
+            )
+
+            self._run_pipeline(
+                bz.data(baseline, name='expr', dshape=self.value_dshape),
+                None,
+                bz.data(
+                    checkpoints,
+                    name='expr_checkpoints',
+                    dshape=self.value_dshape,
+                ),
+                expected_views,
+                expected_output,
+                finder,
+                calendar=pd.date_range('2014-01-01', '2014-01-04'),
+                start=pd.Timestamp('2014-01-03'),
+                end=dates[-1],
+                window_length=1,
+                compute_fn=op.itemgetter(-1),
+            )
+
+    def test_checkpoints(self):
+        nassets = len(simple_asset_info)
+        ffilled_values = (np.arange(nassets, dtype=np.float64) + 1) * 10
+        dates = [pd.Timestamp('2014-01-02')] * nassets
+        checkpoints = pd.DataFrame({
+            'sid': simple_asset_info.index,
+            'value': ffilled_values,
+            'asof_date': dates,
+            'timestamp': dates,
+        })
+
+        self._test_checkpoints(checkpoints, ffilled_values)
+
+    def test_empty_checkpoints(self):
+        checkpoints = pd.DataFrame({
+            'sid': [],
+            'value': [],
+            'asof_date': [],
+            'timestamp': [],
+        })
+
+        self._test_checkpoints(checkpoints)
+
+    def test_checkpoints_out_of_bounds(self):
+        nassets = len(simple_asset_info)
+        # provide two sets of checkpoints, one before the data in the base
+        # table and one after, these should not affect the value on the third
+        dates = pd.to_datetime(['2013-12-31', '2014-01-05'])
+        dates_repeated = np.tile(dates, nassets)
+        ffilled_values = (np.arange(nassets) + 2) * 10
+        ffilled_values = np.hstack((ffilled_values[::-1], ffilled_values))
+        checkpoints = pd.DataFrame({
+            'sid': np.tile(simple_asset_info.index, 2),
+            'value': ffilled_values,
+            'asof_date': dates_repeated,
+            'timestamp': dates_repeated,
+        })
+
+        self._test_checkpoints(checkpoints)
+
+
+class MiscTestCase(ZiplineTestCase):
+    def test_exprdata_repr(self):
+        strd = set()
+
+        class BadRepr(object):
+            """A class which cannot be repr'd.
+            """
+            def __init__(self, name):
+                self._name = name
+
+            def __repr__(self):  # pragma: no cover
+                raise AssertionError('ayy')
+
+            def __str__(self):
+                strd.add(self)
+                return self._name
+
+        assert_equal(
+            repr(ExprData(
+                expr=BadRepr('expr'),
+                deltas=BadRepr('deltas'),
+                checkpoints=BadRepr('checkpoints'),
+                odo_kwargs={'a': 'b'},
+            )),
+            "ExprData(expr='expr', deltas='deltas',"
+            " checkpoints='checkpoints', odo_kwargs={'a': 'b'})",
+        )
+
+    def test_blaze_loader_repr(self):
+        assert_equal(repr(BlazeLoader()), '<BlazeLoader: {}>')
+
+    def test_blaze_loader_lookup_failure(self):
+        class D(DataSet):
+            c = Column(dtype='float64')
+
+        with self.assertRaises(KeyError) as e:
+            BlazeLoader()(D.c)
+        assert_equal(str(e.exception), 'D.c::float64')

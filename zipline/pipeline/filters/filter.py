@@ -1,19 +1,28 @@
 """
 filter.py
 """
+from itertools import chain
+from operator import attrgetter
+
 from numpy import (
     float64,
     nan,
     nanpercentile,
 )
-from itertools import chain
-from operator import attrgetter
 
 from zipline.errors import (
     BadPercentileBounds,
+    NonExistentAssetInTimeFrame,
     UnsupportedDataType,
 )
-from zipline.lib.rank import ismissing
+from zipline.lib.labelarray import LabelArray
+from zipline.lib.rank import is_missing
+from zipline.pipeline.expression import (
+    BadBinaryOperator,
+    FILTER_BINOPS,
+    method_name_for_op,
+    NumericalExpression,
+)
 from zipline.pipeline.mixins import (
     CustomTermMixin,
     LatestMixin,
@@ -22,13 +31,8 @@ from zipline.pipeline.mixins import (
     SingleInputMixin,
 )
 from zipline.pipeline.term import ComputableTerm, Term
-from zipline.pipeline.expression import (
-    BadBinaryOperator,
-    FILTER_BINOPS,
-    method_name_for_op,
-    NumericalExpression,
-)
-from zipline.utils.numpy_utils import bool_dtype
+from zipline.utils.input_validation import expect_types
+from zipline.utils.numpy_utils import bool_dtype, repeat_first_axis
 
 
 def concat_tuples(*tuples):
@@ -163,6 +167,10 @@ class Filter(RestrictedDTypeMixin, ComputableTerm):
     output of a Pipeline and for reducing memory consumption of Pipeline
     results.
     """
+    # Filters are window-safe by default, since a yes/no decision means the
+    # same thing from all temporal perspectives.
+    window_safe = True
+
     ALLOWED_DTYPES = (bool_dtype,)  # Used by RestrictedDTypeMixin
     dtype = bool_dtype
 
@@ -228,19 +236,46 @@ class NullFilter(SingleInputMixin, Filter):
 
     Parameters
     ----------
-    factor : zipline.pipeline.Factor
+    factor : zipline.pipeline.Term
         The factor to compare against its missing_value.
     """
     window_length = 0
 
-    def __new__(cls, factor):
+    def __new__(cls, term):
         return super(NullFilter, cls).__new__(
             cls,
-            inputs=(factor,),
+            inputs=(term,),
         )
 
     def _compute(self, arrays, dates, assets, mask):
-        return ismissing(arrays[0], self.inputs[0].missing_value)
+        data = arrays[0]
+        if isinstance(data, LabelArray):
+            return data.is_missing()
+        return is_missing(arrays[0], self.inputs[0].missing_value)
+
+
+class NotNullFilter(SingleInputMixin, Filter):
+    """
+    A Filter indicating whether input values are **not** missing from an input.
+
+    Parameters
+    ----------
+    factor : zipline.pipeline.Term
+        The factor to compare against its missing_value.
+    """
+    window_length = 0
+
+    def __new__(cls, term):
+        return super(NotNullFilter, cls).__new__(
+            cls,
+            inputs=(term,),
+        )
+
+    def _compute(self, arrays, dates, assets, mask):
+        data = arrays[0]
+        if isinstance(data, LabelArray):
+            return ~data.is_missing()
+        return ~is_missing(arrays[0], self.inputs[0].missing_value)
 
 
 class PercentileFilter(SingleInputMixin, Filter):
@@ -273,9 +308,9 @@ class PercentileFilter(SingleInputMixin, Filter):
         return super(PercentileFilter, self)._init(*args, **kwargs)
 
     @classmethod
-    def static_identity(cls, min_percentile, max_percentile, *args, **kwargs):
+    def _static_identity(cls, min_percentile, max_percentile, *args, **kwargs):
         return (
-            super(PercentileFilter, cls).static_identity(*args, **kwargs),
+            super(PercentileFilter, cls)._static_identity(*args, **kwargs),
             min_percentile,
             max_percentile,
         )
@@ -372,8 +407,84 @@ class CustomFilter(PositiveWindowLengthMixin, CustomTermMixin, Filter):
     """
 
 
+class ArrayPredicate(SingleInputMixin, Filter):
+    """
+    A filter applying a function from (ndarray, *args) -> ndarray[bool].
+
+    Parameters
+    ----------
+    term : zipline.pipeline.Term
+        Term producing the array over which the predicate will be computed.
+    op : function(ndarray, *args) -> ndarray[bool]
+        Function to apply to the result of `term`.
+    opargs : tuple[hashable]
+        Additional argument to apply to ``op``.
+    """
+    window_length = 0
+
+    @expect_types(term=Term, opargs=tuple)
+    def __new__(cls, term, op, opargs):
+        hash(opargs)  # fail fast if opargs isn't hashable.
+        return super(ArrayPredicate, cls).__new__(
+            ArrayPredicate,
+            op=op,
+            opargs=opargs,
+            inputs=(term,),
+            mask=term.mask,
+        )
+
+    def _init(self, op, opargs, *args, **kwargs):
+        self._op = op
+        self._opargs = opargs
+        return super(ArrayPredicate, self)._init(*args, **kwargs)
+
+    @classmethod
+    def _static_identity(cls, op, opargs, *args, **kwargs):
+        return (
+            super(ArrayPredicate, cls)._static_identity(*args, **kwargs),
+            op,
+            opargs,
+        )
+
+    def _compute(self, arrays, dates, assets, mask):
+        data = arrays[0]
+        return self._op(data, *self._opargs) & mask
+
+
 class Latest(LatestMixin, CustomFilter):
     """
     Filter producing the most recently-known value of `inputs[0]` on each day.
     """
     pass
+
+
+class SingleAsset(Filter):
+    """
+    A Filter that computes to True only for the given asset.
+    """
+    inputs = []
+    window_length = 1
+
+    def __new__(cls, asset):
+        return super(SingleAsset, cls).__new__(cls, asset=asset)
+
+    def _init(self, asset, *args, **kwargs):
+        self._asset = asset
+        return super(SingleAsset, self)._init(*args, **kwargs)
+
+    @classmethod
+    def _static_identity(cls, asset, *args, **kwargs):
+        return (
+            super(SingleAsset, cls)._static_identity(*args, **kwargs), asset,
+        )
+
+    def _compute(self, arrays, dates, assets, mask):
+        is_my_asset = (assets == self._asset.sid)
+        out = repeat_first_axis(is_my_asset, len(mask))
+        # Raise an exception if `self._asset` does not exist for the entirety
+        # of the timeframe over which we are computing.
+        if (is_my_asset.sum() != 1) or ((out & mask).sum() != len(mask)):
+            raise NonExistentAssetInTimeFrame(
+                asset=self._asset, start_date=dates[0], end_date=dates[-1],
+            )
+        return out

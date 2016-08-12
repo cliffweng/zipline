@@ -12,18 +12,19 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+from functools import partial
+import tarfile
 
-# This code is based on a unittest written by John Salvatier:
-# https://github.com/pymc-devs/pymc/blob/pymc3/tests/test_examples.py
-
-import glob
 import matplotlib
 from nose_parameterized import parameterized
-import os
-import runpy
-from unittest import TestCase
+import pandas as pd
 
-from zipline.utils import parse_args, run_pipeline
+from zipline import examples
+from zipline.data.bundles import register, unregister
+from zipline.testing import test_resource_path
+from zipline.testing.fixtures import WithTmpDir, ZiplineTestCase
+from zipline.testing.predicates import assert_equal
+from zipline.utils.cache import dataframe_cache
 
 # Otherwise the next line sometimes complains about being run too late.
 _multiprocess_can_split_ = False
@@ -31,22 +32,42 @@ _multiprocess_can_split_ = False
 matplotlib.use('Agg')
 
 
-def example_dir():
-    import zipline
-    d = os.path.dirname(zipline.__file__)
-    return os.path.join(os.path.abspath(d), 'examples')
+class ExamplesTests(WithTmpDir, ZiplineTestCase):
+    # some columns contain values with unique ids that will not be the same
 
+    @classmethod
+    def init_class_fixtures(cls):
+        super(ExamplesTests, cls).init_class_fixtures()
 
-class ExamplesTests(TestCase):
-    # Test algorithms as if they are executed directly from the command line.
-    @parameterized.expand(((os.path.basename(f).replace('.', '_'), f) for f in
-                           glob.glob(os.path.join(example_dir(), '*.py'))))
-    def test_example(self, name, example):
-        runpy.run_path(example, run_name='__main__')
+        register('test', lambda *args: None)
+        cls.add_class_callback(partial(unregister, 'test'))
 
-    # Test algorithm as if scripts/run_algo.py is being used.
-    def test_example_run_pipline(self):
-        example = os.path.join(example_dir(), 'buyapple.py')
-        confs = ['-f', example, '--start', '2011-1-1', '--end', '2012-1-1']
-        parsed_args = parse_args(confs)
-        run_pipeline(**parsed_args)
+        with tarfile.open(test_resource_path('example_data.tar.gz')) as tar:
+            tar.extractall(cls.tmpdir.path)
+
+        cls.expected_perf = dataframe_cache(
+            cls.tmpdir.getpath(
+                'example_data/expected_perf/%s' %
+                pd.__version__.replace('.', '-'),
+            ),
+            serialization='pickle',
+        )
+
+    @parameterized.expand(examples.EXAMPLE_MODULES)
+    def test_example(self, example_name):
+        actual_perf = examples.run_example(
+            example_name,
+            # This should match the invocation in
+            # zipline/tests/resources/rebuild_example_data
+            environ={
+                'ZIPLINE_ROOT': self.tmpdir.getpath('example_data/root'),
+            },
+        )
+        assert_equal(
+            actual_perf[examples._cols_to_check],
+            self.expected_perf[example_name][examples._cols_to_check],
+            # There is a difference in the datetime columns in pandas
+            # 0.16 and 0.17 because in 16 they are object and in 17 they are
+            # datetime[ns, UTC]. We will just ignore the dtypes for now.
+            check_dtype=False,
+        )

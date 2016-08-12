@@ -1,5 +1,5 @@
 #
-# Copyright 2013 Quantopian, Inc.
+# Copyright 2015 Quantopian, Inc.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -21,7 +21,10 @@ class ZiplineError(Exception):
 
     def __init__(self, **kwargs):
         self.kwargs = kwargs
-        self.message = str(self)
+
+    @lazyval
+    def message(self):
+        return str(self)
 
     def __str__(self):
         msg = self.msg.format(**self.kwargs)
@@ -29,6 +32,33 @@ class ZiplineError(Exception):
 
     __unicode__ = __str__
     __repr__ = __str__
+
+
+class NoTradeDataAvailable(ZiplineError):
+    pass
+
+
+class NoTradeDataAvailableTooEarly(NoTradeDataAvailable):
+    msg = "{sid} does not exist on {dt}. It started trading on {start_dt}."
+
+
+class NoTradeDataAvailableTooLate(NoTradeDataAvailable):
+    msg = "{sid} does not exist on {dt}. It stopped trading on {end_dt}."
+
+
+class BenchmarkAssetNotAvailableTooEarly(NoTradeDataAvailableTooEarly):
+    pass
+
+
+class BenchmarkAssetNotAvailableTooLate(NoTradeDataAvailableTooLate):
+    pass
+
+
+class InvalidBenchmarkAsset(ZiplineError):
+    msg = """
+{sid} cannot be used as the benchmark because it has a stock \
+dividend on {dt}.  Choose another asset to use as the benchmark.
+""".strip()
 
 
 class WrongDataForTransform(ZiplineError):
@@ -60,6 +90,15 @@ You may only call 'set_slippage' in your initialize method.
 """.strip()
 
 
+class SetCancelPolicyPostInit(ZiplineError):
+    # Raised if a users script calls set_cancel_policy
+    # after the initialize method has returned.
+    msg = """
+You attempted to set the cancel policy outside of `initialize`. \
+You may only call 'set_cancel_policy' in your initialize method.
+""".strip()
+
+
 class RegisterTradingControlPostInit(ZiplineError):
     # Raised if a user's script register's a trading control after initialize
     # has been run.
@@ -87,6 +126,17 @@ class UnsupportedCommissionModel(ZiplineError):
     msg = """
 You attempted to set commission with an unsupported class. \
 Please use PerShare or PerTrade.
+""".strip()
+
+
+class UnsupportedCancelPolicy(ZiplineError):
+    """
+    Raised if a user script calls set_cancel_policy with an object that isn't
+    a CancelPolicy.
+    """
+    msg = """
+You attempted to set the cancel policy with an unsupported class.  Please use
+an instance of CancelPolicy.
 """.strip()
 
 
@@ -147,6 +197,13 @@ class UnsupportedOrderParameters(ZiplineError):
     msg = "{msg}"
 
 
+class CannotOrderDelistedAsset(ZiplineError):
+    """
+    Raised if an order is for a delisted asset.
+    """
+    msg = "{msg}"
+
+
 class BadOrderParameters(ZiplineError):
     """
     Raised if any impossible parameters (nan, negative limit/stop)
@@ -160,6 +217,13 @@ class OrderDuringInitialize(ZiplineError):
     Raised if order is called during initialize()
     """
     msg = "{msg}"
+
+
+class SetBenchmarkOutsideInitialize(ZiplineError):
+    """
+    Raised if set_benchmark is called outside initialize()
+    """
+    msg = "'set_benchmark' can only be called within initialize function."
 
 
 class AccountControlViolation(ZiplineError):
@@ -199,6 +263,13 @@ class HistoryInInitialize(ZiplineError):
     msg = "history() should only be called in handle_data()"
 
 
+class OrderInBeforeTradingStart(ZiplineError):
+    """
+    Raised when an algorithm calls an order method in before_trading_start.
+    """
+    msg = "Cannot place orders inside before_trading_start."
+
+
 class MultipleSymbolsFound(ZiplineError):
     """
     Raised when a symbol() call contains a symbol that changed over
@@ -210,7 +281,7 @@ Multiple symbols with the name '{symbol}' found. Use the
 as_of_date' argument to to specify when the date symbol-lookup
 should be valid.
 
-Possible options:{options}
+Possible options: {options}
     """.strip()
 
 
@@ -347,10 +418,10 @@ class WindowLengthNotPositive(ZiplineError):
     ).strip()
 
 
-class WindowedInputToWindowedTerm(ZiplineError):
+class NonWindowSafeInput(ZiplineError):
     """
-    Raised when a windowed Pipeline API term is specified as an input to
-    another windowed term.
+    Raised when a Pipeline API term that is not deemed window safe is specified
+    as an input to another windowed term.
 
     This is an error because it's generally not safe to compose windowed
     functions on split/dividend adjusted data.
@@ -369,10 +440,31 @@ class TermInputsNotSpecified(ZiplineError):
     msg = "{termname} requires inputs, but no inputs list was passed."
 
 
+class TermOutputsEmpty(ZiplineError):
+    """
+    Raised if a user attempts to construct a term with an empty outputs list.
+    """
+    msg = (
+        "{termname} requires at least one output when passed an outputs "
+        "argument."
+    )
+
+
+class InvalidOutputName(ZiplineError):
+    """
+    Raised if a term's output names conflict with any of its attributes.
+    """
+    msg = (
+        "{output_name!r} cannot be used as an output name for {termname}. "
+        "Output names cannot start with an underscore or be contained in the "
+        "following list: {disallowed_names}."
+    )
+
+
 class WindowLengthNotSpecified(ZiplineError):
     """
-    Raised if a user attempts to construct a term without specifying inputs and
-    that term does not have class-level default inputs.
+    Raised if a user attempts to construct a term without specifying window
+    length and that term does not have a class-level default window length.
     """
     msg = (
         "{termname} requires a window_length, but no window_length was passed."
@@ -528,4 +620,79 @@ class AssetDBImpossibleDowngrade(ZiplineError):
     msg = (
         "The existing Asset database is version: {db_version} which is lower "
         "than the desired downgrade version: {desired_version}."
+    )
+
+
+class HistoryWindowStartsBeforeData(ZiplineError):
+    msg = (
+        "History window extends before {first_trading_day}. To use this "
+        "history window, start the backtest on or after {suggested_start_day}."
+        )
+
+
+class NonExistentAssetInTimeFrame(ZiplineError):
+    msg = (
+        "The target asset '{asset}' does not exist for the entire timeframe "
+        "between {start_date} and {end_date}."
+    )
+
+
+class InvalidCalendarName(ZiplineError):
+    """
+    Raised when a calendar with an invalid name is requested.
+    """
+    msg = (
+        "The requested TradingCalendar, {calendar_name}, does not exist."
+    )
+
+
+class CalendarNameCollision(ZiplineError):
+    """
+    Raised when the static calendar registry already has a calendar with a
+    given name.
+    """
+    msg = (
+        "A calendar with the name {calendar_name} is already registered."
+    )
+
+
+class ScheduleFunctionWithoutCalendar(ZiplineError):
+    """
+    Raised when schedule_function is called but there is not a calendar to be
+    used in the construction of an event rule.
+    """
+    # TODO update message when new TradingSchedules are built
+    msg = (
+        "To use schedule_function, the TradingAlgorithm must be running on an "
+        "ExchangeTradingSchedule, rather than {schedule}."
+    )
+
+
+class UnsupportedPipelineOutput(ZiplineError):
+    """
+    Raised when a 1D term is added as a column to a pipeline.
+    """
+    msg = (
+        "Cannot add column {column_name!r} with term {term}. Adding slices or "
+        "single-column-output terms as pipeline columns is not currently "
+        "supported."
+    )
+
+
+class NonSliceableTerm(ZiplineError):
+    """
+    Raised when attempting to index into a non-sliceable term, e.g. instances
+    of `zipline.pipeline.term.LoadableTerm`.
+    """
+    msg = "Taking slices of {term} is not currently supported."
+
+
+class IncompatibleTerms(ZiplineError):
+    """
+    Raised when trying to compute correlations/regressions between two 2D
+    factors with different masks.
+    """
+    msg = (
+        "{term_1} and {term_2} must have the same mask in order to compute "
+        "correlations and regressions asset-wise."
     )

@@ -12,15 +12,11 @@ from six import (
     with_metaclass,
 )
 from numpy import array
-from pandas import (
-    DataFrame,
-    date_range,
-    MultiIndex,
-)
+from pandas import DataFrame, MultiIndex
 from toolz import groupby, juxt
 from toolz.curried.operator import getitem
 
-from zipline.lib.adjusted_array import ensure_ndarray
+from zipline.lib.adjusted_array import ensure_adjusted_array, ensure_ndarray
 from zipline.errors import NoFurtherDataError
 from zipline.utils.numpy_utils import repeat_first_axis, repeat_last_axis
 from zipline.utils.pandas_utils import explode
@@ -51,7 +47,7 @@ class PipelineEngine(with_metaclass(ABCMeta)):
         result : pd.DataFrame
             A frame of computed results.
 
-            The columns `result` correspond will be the computed results of
+            The columns `result` correspond to the entries of
             `pipeline.columns`, which should be a dictionary mapping strings to
             instances of `zipline.pipeline.term.Term`.
 
@@ -63,16 +59,21 @@ class PipelineEngine(with_metaclass(ABCMeta)):
         raise NotImplementedError("run_pipeline")
 
 
-class NoOpPipelineEngine(PipelineEngine):
+class NoEngineRegistered(Exception):
+    """
+    Raised if a user tries to call pipeline_output in an algorithm that hasn't
+    set up a pipeline engine.
+    """
+
+
+class ExplodingPipelineEngine(PipelineEngine):
     """
     A PipelineEngine that doesn't do anything.
     """
     def run_pipeline(self, pipeline, start_date, end_date):
-        return DataFrame(
-            index=MultiIndex.from_product(
-                [date_range(start=start_date, end=end_date, freq='D'), ()],
-            ),
-            columns=sorted(pipeline.columns.keys()),
+        raise NoEngineRegistered(
+            "Attempted to run a pipeline but no pipeline "
+            "resources were registered."
         )
 
 
@@ -165,17 +166,20 @@ class SimplePipelineEngine(object):
         root_mask = self._compute_root_mask(start_date, end_date, extra_rows)
         dates, assets, root_mask_values = explode(root_mask)
 
-        outputs = self.compute_chunk(
+        results = self.compute_chunk(
             graph,
             dates,
             assets,
             initial_workspace={self._root_mask_term: root_mask_values},
         )
 
-        out_dates = dates[extra_rows:]
-        screen_values = outputs.pop(screen_name)
-
-        return self._to_narrow(outputs, screen_values, out_dates, assets)
+        return self._to_narrow(
+            graph.outputs,
+            results,
+            results.pop(screen_name),
+            dates[extra_rows:],
+            assets,
+        )
 
     def _compute_root_mask(self, start_date, end_date, extra_rows):
         """
@@ -237,13 +241,20 @@ class SimplePipelineEngine(object):
         assert shape[0] * shape[1] != 0, 'root mask cannot be empty'
         return ret
 
-    def _mask_and_dates_for_term(self, term, workspace, graph, dates):
+    def _mask_and_dates_for_term(self, term, workspace, graph, all_dates):
         """
         Load mask and mask row labels for term.
         """
         mask = term.mask
-        offset = graph.extra_rows[mask] - graph.extra_rows[term]
-        return workspace[mask][offset:], dates[offset:]
+        mask_offset = graph.extra_rows[mask] - graph.extra_rows[term]
+
+        # This offset is computed against _root_mask_term because that is what
+        # determines the shape of the top-level dates array.
+        dates_offset = (
+            graph.extra_rows[self._root_mask_term] - graph.extra_rows[term]
+        )
+
+        return workspace[mask][mask_offset:], all_dates[dates_offset:]
 
     @staticmethod
     def _inputs_for_term(term, workspace, graph):
@@ -255,28 +266,31 @@ class SimplePipelineEngine(object):
         that input.
         """
         offsets = graph.offset
+        out = []
         if term.windowed:
             # If term is windowed, then all input data should be instances of
             # AdjustedArray.
-            return [
-                workspace[input_].traverse(
-                    window_length=term.window_length,
-                    offset=offsets[term, input_]
+            for input_ in term.inputs:
+                adjusted_array = ensure_adjusted_array(
+                    workspace[input_], input_.missing_value,
                 )
-                for input_ in term.inputs
-            ]
-
-        # If term is not windowed, input_data may be an AdjustedArray or
-        # np.ndarray.  Coerce the former to the latter.
-        out = []
-        for input_ in term.inputs:
-            input_data = ensure_ndarray(workspace[input_])
-            offset = offsets[term, input_]
-            # OPTIMIZATION: Don't make a copy by doing input_data[0:] if
-            # offset is zero.
-            if offset:
-                input_data = input_data[offset:]
-            out.append(input_data)
+                out.append(
+                    adjusted_array.traverse(
+                        window_length=term.window_length,
+                        offset=offsets[term, input_],
+                    )
+                )
+        else:
+            # If term is not windowed, input_data may be an AdjustedArray or
+            # np.ndarray.  Coerce the former to the latter.
+            for input_ in term.inputs:
+                input_data = ensure_ndarray(workspace[input_])
+                offset = offsets[term, input_]
+                # OPTIMIZATION: Don't make a copy by doing input_data[0:] if
+                # offset is zero.
+                if offset:
+                    input_data = input_data[offset:]
+                out.append(input_data)
         return out
 
     def get_loader(self, term):
@@ -347,7 +361,10 @@ class SimplePipelineEngine(object):
                     assets,
                     mask,
                 )
-                assert(workspace[term].shape == mask.shape)
+                if term.ndim == 2:
+                    assert workspace[term].shape == mask.shape
+                else:
+                    assert workspace[term].shape == (mask.shape[0], 1)
 
         out = {}
         graph_extra_rows = graph.extra_rows
@@ -356,14 +373,16 @@ class SimplePipelineEngine(object):
             out[name] = workspace[term][graph_extra_rows[term]:]
         return out
 
-    def _to_narrow(self, data, mask, dates, assets):
+    def _to_narrow(self, terms, data, mask, dates, assets):
         """
         Convert raw computed pipeline results into a DataFrame for public APIs.
 
         Parameters
         ----------
+        terms : dict[str -> Term]
+            Dict mapping column names to terms.
         data : dict[str -> ndarray[ndim=2]]
-            Dict mapping column names to computed results.
+            Dict mapping column names to computed results for those names.
         mask : ndarray[bool, ndim=2]
             Mask array of values to keep.
         dates : ndarray[datetime64, ndim=1]
@@ -405,8 +424,18 @@ class SimplePipelineEngine(object):
         resolved_assets = array(self._finder.retrieve_all(assets))
         dates_kept = repeat_last_axis(dates.values, len(assets))[mask]
         assets_kept = repeat_first_axis(resolved_assets, len(dates))[mask]
+
+        final_columns = {}
+        for name in data:
+            # Each term that computed an output has its postprocess method
+            # called on the filtered result.
+            #
+            # As of Mon May 2 15:38:47 2016, we only use this to convert
+            # LabelArrays into categoricals.
+            final_columns[name] = terms[name].postprocess(data[name][mask])
+
         return DataFrame(
-            data={name: arr[mask] for name, arr in iteritems(data)},
+            data=final_columns,
             index=MultiIndex.from_arrays([dates_kept, assets_kept]),
         ).tz_localize('UTC', level=0)
 
@@ -416,6 +445,7 @@ class SimplePipelineEngine(object):
         """
         root = self._root_mask_term
         clsname = type(self).__name__
+
         # Writing this out explicitly so this errors in testing if we change
         # the name without updating this line.
         compute_chunk_name = self.compute_chunk.__name__

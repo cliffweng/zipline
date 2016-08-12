@@ -16,12 +16,53 @@ from functools import partial, wraps
 from operator import attrgetter
 
 from numpy import dtype
+import pandas as pd
 from pytz import timezone
 from six import iteritems, string_types, PY3
 from toolz import valmap, complement, compose
 import toolz.curried.operator as op
 
-from zipline.utils.preprocess import preprocess
+from zipline.utils.functional import getattrs
+from zipline.utils.preprocess import call, preprocess
+
+
+def verify_indices_all_unique(obj):
+    """
+    Check that all axes of a pandas object are unique.
+
+    Parameters
+    ----------
+    obj : pd.Series / pd.DataFrame / pd.Panel
+        The object to validate.
+
+    Returns
+    -------
+    obj : pd.Series / pd.DataFrame / pd.Panel
+        The validated object, unchanged.
+
+    Raises
+    ------
+    ValueError
+        If any axis has duplicate entries.
+    """
+    axis_names = [
+        ('index',),                            # Series
+        ('index', 'columns'),                  # DataFrame
+        ('items', 'major_axis', 'minor_axis')  # Panel
+    ][obj.ndim - 1]  # ndim = 1 should go to entry 0,
+
+    for axis_name, index in zip(axis_names, obj.axes):
+        if index.is_unique:
+            continue
+
+        raise ValueError(
+            "Duplicate entries in {type}.{axis}: {dupes}.".format(
+                type=type(obj).__name__,
+                axis=axis_name,
+                dupes=sorted(index[index.duplicated()]),
+            )
+        )
+    return obj
 
 
 def optionally(preprocessor):
@@ -71,7 +112,10 @@ def ensure_upper_case(func, argname, arg):
         raise TypeError(
             "{0}() expected argument '{1}' to"
             " be a string, but got {2} instead.".format(
-                func.__name__, argname, arg,)
+                func.__name__,
+                argname,
+                arg,
+            ),
         )
 
 
@@ -130,27 +174,55 @@ def ensure_timezone(func, argname, arg):
     )
 
 
-def expect_dtypes(*_pos, **named):
+def ensure_timestamp(func, argname, arg):
+    """Argument preprocessor that converts the input into a pandas Timestamp
+    object.
+
+    Usage
+    -----
+    >>> from zipline.utils.preprocess import preprocess
+    >>> @preprocess(ts=ensure_timestamp)
+    ... def foo(ts):
+    ...     return ts
+    >>> foo('2014-01-01')
+    Timestamp('2014-01-01 00:00:00')
+    """
+    try:
+        return pd.Timestamp(arg)
+    except ValueError as e:
+        raise TypeError(
+            "{func}() couldn't convert argument "
+            "{argname}={arg!r} to a pandas Timestamp.\n"
+            "Original error was: {t}: {e}".format(
+                func=_qualified_name(func),
+                argname=argname,
+                arg=arg,
+                t=_qualified_name(type(e)),
+                e=e,
+            ),
+        )
+
+
+def expect_dtypes(**named):
     """
     Preprocessing decorator that verifies inputs have expected numpy dtypes.
 
     Usage
     -----
-    >>> from numpy import dtype, arange
-    >>> @expect_dtypes(x=dtype(int))
+    >>> from numpy import dtype, arange, int8, float64
+    >>> @expect_dtypes(x=dtype(int8))
     ... def foo(x, y):
     ...    return x, y
     ...
-    >>> foo(arange(3), 'foo')
-    (array([0, 1, 2]), 'foo')
-    >>> foo(arange(3, dtype=float), 'foo')
+    >>> foo(arange(3, dtype=int8), 'foo')
+    (array([0, 1, 2], dtype=int8), 'foo')
+    >>> foo(arange(3, dtype=float64), 'foo')  # doctest: +NORMALIZE_WHITESPACE
+    ...                                       # doctest: +ELLIPSIS
     Traceback (most recent call last):
        ...
-    TypeError: foo() expected an argument with dtype 'int64' for argument 'x', but got dtype 'float64' instead.  # noqa
+    TypeError: ...foo() expected a value with dtype 'int8' for argument 'x',
+    but got 'float64' instead.
     """
-    if _pos:
-        raise TypeError("expect_dtypes() only takes keyword arguments.")
-
     for name, type_ in iteritems(named):
         if not isinstance(type_, (dtype, tuple)):
             raise TypeError(
@@ -160,40 +232,100 @@ def expect_dtypes(*_pos, **named):
                 )
             )
 
-    def _expect_dtype(_dtype_or_dtype_tuple):
+    @preprocess(dtypes=call(lambda x: x if isinstance(x, tuple) else (x,)))
+    def _expect_dtype(dtypes):
         """
-        Factory for dtype-checking functions that work the @preprocess
+        Factory for dtype-checking functions that work with the @preprocess
         decorator.
         """
-        # Slightly different messages for dtype and tuple of dtypes.
-        if isinstance(_dtype_or_dtype_tuple, tuple):
-            allowed_dtypes = _dtype_or_dtype_tuple
-        else:
-            allowed_dtypes = (_dtype_or_dtype_tuple,)
-        template = (
-            "%(funcname)s() expected a value with dtype {dtype_str} "
-            "for argument '%(argname)s', but got %(actual)r instead."
-        ).format(dtype_str=' or '.join(repr(d.name) for d in allowed_dtypes))
-
-        def check_dtype(value):
-            return getattr(value, 'dtype', None) not in allowed_dtypes
-
-        def display_bad_value(value):
+        def error_message(func, argname, value):
             # If the bad value has a dtype, but it's wrong, show the dtype
-            # name.
+            # name.  Otherwise just show the value.
             try:
-                return value.dtype.name
+                value_to_show = value.dtype.name
             except AttributeError:
-                return value
+                value_to_show = value
+            return (
+                "{funcname}() expected a value with dtype {dtype_str} "
+                "for argument {argname!r}, but got {value!r} instead."
+            ).format(
+                funcname=_qualified_name(func),
+                dtype_str=' or '.join(repr(d.name) for d in dtypes),
+                argname=argname,
+                value=value_to_show,
+            )
 
-        return make_check(
-            exc_type=TypeError,
-            template=template,
-            pred=check_dtype,
-            actual=display_bad_value,
-        )
+        def _actual_preprocessor(func, argname, argvalue):
+            if getattr(argvalue, 'dtype', object()) not in dtypes:
+                raise TypeError(error_message(func, argname, argvalue))
+            return argvalue
+
+        return _actual_preprocessor
 
     return preprocess(**valmap(_expect_dtype, named))
+
+
+def expect_kinds(**named):
+    """
+    Preprocessing decorator that verifies inputs have expected dtype kinds.
+
+    Usage
+    -----
+    >>> from numpy import int64, int32, float32
+    >>> @expect_kinds(x='i')
+    ... def foo(x):
+    ...    return x
+    ...
+    >>> foo(int64(2))
+    2
+    >>> foo(int32(2))
+    2
+    >>> foo(float32(2))  # doctest: +NORMALIZE_WHITESPACE +ELLIPSIS
+    Traceback (most recent call last):
+       ...
+    TypeError: ...foo() expected a numpy object of kind 'i' for argument 'x',
+    but got 'f' instead.
+    """
+    for name, kind in iteritems(named):
+        if not isinstance(kind, (str, tuple)):
+            raise TypeError(
+                "expect_dtype_kinds() expected a string or tuple of strings"
+                " for argument {name!r}, but got {kind} instead.".format(
+                    name=name, kind=dtype,
+                )
+            )
+
+    @preprocess(kinds=call(lambda x: x if isinstance(x, tuple) else (x,)))
+    def _expect_kind(kinds):
+        """
+        Factory for kind-checking functions that work the @preprocess
+        decorator.
+        """
+        def error_message(func, argname, value):
+            # If the bad value has a dtype, but it's wrong, show the dtype
+            # kind.  Otherwise just show the value.
+            try:
+                value_to_show = value.dtype.kind
+            except AttributeError:
+                value_to_show = value
+            return (
+                "{funcname}() expected a numpy object of kind {kinds} "
+                "for argument {argname!r}, but got {value!r} instead."
+            ).format(
+                funcname=_qualified_name(func),
+                kinds=' or '.join(map(repr, kinds)),
+                argname=argname,
+                value=value_to_show,
+            )
+
+        def _actual_preprocessor(func, argname, argvalue):
+            if getattrs(argvalue, ('dtype', 'kind'), object()) not in kinds:
+                raise TypeError(error_message(func, argname, argvalue))
+            return argvalue
+
+        return _actual_preprocessor
+
+    return preprocess(**valmap(_expect_kind, named))
 
 
 def expect_types(*_pos, **named):
@@ -208,10 +340,11 @@ def expect_types(*_pos, **named):
     ...
     >>> foo(2, '3')
     (2, '3')
-    >>> foo(2.0, '3')
+    >>> foo(2.0, '3')  # doctest: +NORMALIZE_WHITESPACE +ELLIPSIS
     Traceback (most recent call last):
        ...
-    TypeError: foo() expected an argument of type 'int' for argument 'x', but got float instead.  # noqa
+    TypeError: ...foo() expected a value of type int for argument 'x',
+    but got float instead.
     """
     if _pos:
         raise TypeError("expect_types() only takes keyword arguments.")
@@ -334,10 +467,11 @@ def expect_element(*_pos, **named):
     'A'
     >>> foo('b')
     'B'
-    >>> foo('c')
+    >>> foo('c')  # doctest: +NORMALIZE_WHITESPACE +ELLIPSIS
     Traceback (most recent call last):
        ...
-    ValueError: foo() expected a value in ('a', 'b') for argument 'x', but got 'c' instead.  # noqa
+    ValueError: ...foo() expected a value in ('a', 'b') for argument 'x',
+    but got 'c' instead.
 
     Notes
     -----
@@ -376,10 +510,12 @@ def expect_dimensions(**dimensions):
     ...
     >>> foo(array([1, 1]), array([[1, 1], [2, 2]]))
     2
-    >>> foo(array([1, 1], array([1, 1])))
+    >>> foo(array([1, 1]), array([1, 1]))  # doctest: +NORMALIZE_WHITESPACE
+    ...                                    # doctest: +ELLIPSIS
     Traceback (most recent call last):
        ...
-    TypeError: foo() expected a 2-D array for argument 'y', but got a 1-D array instead.  # noqa
+    ValueError: ...foo() expected a 2-D array for argument 'y',
+    but got a 1-D array instead.
     """
     def _expect_dimension(expected_ndim):
         def _check(func, argname, argvalue):
@@ -440,6 +576,20 @@ def coerce(from_, to, **to_kwargs):
             return to(arg, **to_kwargs)
         return arg
     return preprocessor
+
+
+class error_keywords(object):
+
+    def __init__(self, *args, **kwargs):
+        self.messages = kwargs
+
+    def __call__(self, func):
+        def assert_keywords_and_call(*args, **kwargs):
+            for field, message in iteritems(self.messages):
+                if field in kwargs:
+                    raise TypeError(message)
+            return func(*args, **kwargs)
+        return assert_keywords_and_call
 
 
 coerce_string = partial(coerce, string_types)

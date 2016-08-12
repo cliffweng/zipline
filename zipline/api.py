@@ -15,33 +15,33 @@
 
 # Note that part of the API is implemented in TradingAlgorithm as
 # methods (e.g. order). These are added to this namespace via the
-# decorator `api_methods` inside of algorithm.py.
-
-import zipline
-from .finance import (commission, slippage)
-from .utils import math_utils, events
-
-from zipline.finance.slippage import (
+# decorator ``api_method`` inside of algorithm.py.
+from .finance import commission, execution, slippage, cancel_policy
+from .finance.cancel_policy import (
+    NeverCancel,
+    EODCancel
+)
+from .finance.slippage import (
     FixedSlippage,
     VolumeShareSlippage,
 )
-
-from zipline.utils.events import (
+from .utils import math_utils, events
+from .utils.events import (
     date_rules,
     time_rules
 )
 
-batch_transform = zipline.transforms.BatchTransform
-
-
 __all__ = [
-    'slippage',
-    'commission',
-    'events',
-    'math_utils',
-    'batch_transform',
+    'EODCancel',
     'FixedSlippage',
+    'NeverCancel',
     'VolumeShareSlippage',
+    'cancel_policy',
+    'commission',
     'date_rules',
+    'events',
+    'execution',
+    'math_utils',
+    'slippage',
     'time_rules'
 ]

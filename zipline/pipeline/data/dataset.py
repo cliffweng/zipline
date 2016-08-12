@@ -7,18 +7,17 @@ from six import (
     with_metaclass,
 )
 
+from zipline.pipeline.classifiers import Classifier, Latest as LatestClassifier
+from zipline.pipeline.factors import Factor, Latest as LatestFactor
+from zipline.pipeline.filters import Filter, Latest as LatestFilter
+from zipline.pipeline.sentinels import NotSpecified
 from zipline.pipeline.term import (
     AssetExists,
     LoadableTerm,
-    NotSpecified,
-    Term,
+    validate_dtype,
 )
 from zipline.utils.input_validation import ensure_dtype
-from zipline.utils.numpy_utils import (
-    bool_dtype,
-    int64_dtype,
-    NoDefaultMissingValue,
-)
+from zipline.utils.numpy_utils import NoDefaultMissingValue
 from zipline.utils.preprocess import preprocess
 
 
@@ -26,7 +25,6 @@ class Column(object):
     """
     An abstract column of data, not yet associated with a dataset.
     """
-
     @preprocess(dtype=ensure_dtype)
     def __init__(self, dtype, missing_value=NotSpecified):
         self.dtype = dtype
@@ -58,7 +56,7 @@ class _BoundColumnDescr(object):
         # (e.g. int64), but still enables us to provide an error message that
         # points to the name of the failing column.
         try:
-            self.dtype, self.missing_value = Term.validate_dtype(
+            self.dtype, self.missing_value = validate_dtype(
                 termname="Column(name={name!r})".format(name=name),
                 dtype=dtype,
                 missing_value=missing_value,
@@ -114,8 +112,8 @@ class BoundColumn(LoadableTerm):
         The name of this column.
     """
     mask = AssetExists()
-    extra_input_rows = 0
     inputs = ()
+    window_safe = True
 
     def __new__(cls, dtype, missing_value, dataset, name):
         return super(BoundColumn, cls).__new__(
@@ -125,6 +123,7 @@ class BoundColumn(LoadableTerm):
             missing_value=missing_value,
             dataset=dataset,
             name=name,
+            ndim=dataset.ndim,
         )
 
     def _init(self, dataset, name, *args, **kwargs):
@@ -133,9 +132,9 @@ class BoundColumn(LoadableTerm):
         return super(BoundColumn, self)._init(*args, **kwargs)
 
     @classmethod
-    def static_identity(cls, dataset, name, *args, **kwargs):
+    def _static_identity(cls, dataset, name, *args, **kwargs):
         return (
-            super(BoundColumn, cls).static_identity(*args, **kwargs),
+            super(BoundColumn, cls)._static_identity(*args, **kwargs),
             dataset,
             name,
         )
@@ -165,16 +164,20 @@ class BoundColumn(LoadableTerm):
 
     @property
     def latest(self):
-        if self.dtype == bool_dtype:
-            from zipline.pipeline.filters import Latest
-        elif self.dtype == int64_dtype:
-            from zipline.pipeline.classifiers import Latest
+        dtype = self.dtype
+        if dtype in Filter.ALLOWED_DTYPES:
+            Latest = LatestFilter
+        elif dtype in Classifier.ALLOWED_DTYPES:
+            Latest = LatestClassifier
         else:
-            from zipline.pipeline.factors import Latest
+            assert dtype in Factor.ALLOWED_DTYPES, "Unknown dtype %s." % dtype
+            Latest = LatestFactor
+
         return Latest(
             inputs=(self,),
-            dtype=self.dtype,
+            dtype=dtype,
             missing_value=self.missing_value,
+            ndim=self.ndim,
         )
 
     def __repr__(self):
@@ -226,3 +229,4 @@ class DataSetMeta(type):
 
 class DataSet(with_metaclass(DataSetMeta, object)):
     domain = None
+    ndim = 2

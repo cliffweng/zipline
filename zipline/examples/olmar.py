@@ -1,11 +1,7 @@
 import sys
 import logbook
 import numpy as np
-from datetime import datetime
-import pytz
 
-from zipline.algorithm import TradingAlgorithm
-from zipline.utils.factory import load_from_yahoo
 from zipline.finance import commission
 
 zipline_logging = logbook.NestedSetup([
@@ -33,7 +29,6 @@ def initialize(algo, eps=1, window_length=5):
     algo.init = True
     algo.days = 0
     algo.window_length = window_length
-    algo.add_transform('mavg', 5)
 
     algo.set_commission(commission.PerShare(cost=0))
 
@@ -54,10 +49,11 @@ def handle_data(algo, data):
     b = np.zeros(m)
 
     # find relative moving average price for each asset
+    mavgs = data.history(algo.sids, 'price', algo.window_length, '1d').mean()
     for i, sid in enumerate(algo.sids):
-        price = data[sid].price
+        price = data.current(sid, "price")
         # Relative mean deviation
-        x_tilde[i] = data[sid].mavg(algo.window_length) / price
+        x_tilde[i] = mavgs[sid] / price
 
     ###########################
     # Inside of OLMAR (algo 2)
@@ -101,7 +97,7 @@ def rebalance_portfolio(algo, data, desired_port):
 
     for i, sid in enumerate(algo.sids):
         current_amount[i] = algo.portfolio.positions[sid].amount
-        prices[i] = data[sid].price
+        prices[i] = data.current(sid, "price")
 
     desired_amount = np.round(desired_port * positions_value / prices)
 
@@ -126,7 +122,7 @@ def simplex_projection(v, b=1):
 
     :Example:
     >>> proj = simplex_projection([.4 ,.3, -.4, .5])
-    >>> print(proj)
+    >>> proj  # doctest: +NORMALIZE_WHITESPACE
     array([ 0.33333333, 0.23333333, 0. , 0.43333333])
     >>> print(proj.sum())
     1.0
@@ -161,22 +157,12 @@ def analyze(context=None, results=None):
     plt.show()
 
 
-# Note: this if-block should be removed if running
-# this algorithm on quantopian.com
-if __name__ == '__main__':
-    # Set the simulation start and end dates.
-    start = datetime(2004, 1, 1, 0, 0, 0, 0, pytz.utc)
-    end = datetime(2008, 1, 1, 0, 0, 0, 0, pytz.utc)
+def _test_args():
+    """Extra arguments to use when zipline's automated tests run this example.
+    """
+    import pandas as pd
 
-    # Load price data from yahoo.
-    data = load_from_yahoo(stocks=STOCKS, indexes={}, start=start, end=end)
-    data = data.dropna()
-
-    # Create and run the algorithm.
-    olmar = TradingAlgorithm(handle_data=handle_data,
-                             initialize=initialize,
-                             identifiers=STOCKS)
-    results = olmar.run(data)
-
-    # Plot the portfolio data.
-    analyze(results=results)
+    return {
+        'start': pd.Timestamp('2004', tz='utc'),
+        'end': pd.Timestamp('2008', tz='utc'),
+    }
